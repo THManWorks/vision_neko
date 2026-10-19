@@ -4,5 +4,6 @@
 int main(){
    
     return neko::vision:: runCameraPreview();
+    return 0;
 }
 
