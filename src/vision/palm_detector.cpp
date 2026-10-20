@@ -2177,7 +2177,10 @@ PalmPreprocessResult preprocessPalmFrame(
     //分别用来保存候选框和分数，同一下标必须对应同一个候选。
     std::vector<cv::Rect> candidateBoxes;
     std::vector<float> candidateScores;
+    // 每个候选保存一组参考点，每组包含 7 个点
+    std::vector<std::array<cv::Point2f, 7>> candidateLandmarks;
     for(int index : candidateIndices){
+        //拿边框点（前四个）
         float dx = raw.rawBoxes.at<float>(0, index, 0);
         float dy = raw.rawBoxes.at<float>(0, index, 1);
         float width = raw.rawBoxes.at<float>(0, index, 2);
@@ -2214,9 +2217,32 @@ PalmPreprocessResult preprocessPalmFrame(
             float score = static_cast<float>(
                 1.0 / (1.0 + std::exp(-logit)));
             
+            std::array<cv::Point2f, 7> landmarks{};
+    
+            //拿参考点
+            for (int k = 0; k < 7; ++k) {
+                // 前 4 个数是边框参数，从下标 4 开始读取参考点偏移
+                float landmarkDx = raw.rawBoxes.at<float>(0, index, 4 + 2 * k);
+                float landmarkDy = raw.rawBoxes.at<float>(0, index, 5 + 2 * k);
+
+                // 锚点加偏移，得到 192×192 输入图中的位置
+                double pointX = anchor.x * 192.0 + landmarkDx;
+                double pointY = anchor.y * 192.0 + landmarkDy;
+
+                // 撤销补边和缩放，还原到原图
+                pointX = (pointX - input.left) / scaleX;
+                pointY = (pointY - input.top) / scaleY;
+
+                landmarks[k] = cv::Point2f(
+                    static_cast<float>(pointX),
+                    static_cast<float>(pointY));
+            }
+
+
             //装入容器，只保存先不画
             candidateBoxes.push_back(box);
             candidateScores.push_back(score);
+            candidateLandmarks.push_back(landmarks);
         }
     }
     //保存“保留编号”的容器
@@ -2239,7 +2265,8 @@ PalmPreprocessResult preprocessPalmFrame(
         detections.push_back(
             PalmDetection{
                 candidateBoxes[index],
-                candidateScores[index]
+                candidateScores[index],
+                candidateLandmarks[index]
             }
         );
     

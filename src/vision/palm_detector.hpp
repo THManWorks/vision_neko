@@ -1,5 +1,5 @@
 #pragma once
-
+#include <array>
 #include<string>
 #include<opencv2/dnn.hpp>
 #include <vector>
@@ -8,7 +8,11 @@
 
 
 namespace neko::vision{
-    //获取神经网络函数
+    //获取神经网络函数1
+    //手掌检测模型
+    //该模型输出：Identity [1,2016,18] 包含1张图的2016个候选，
+    //每个候选有4个边框参数和7组参考点偏移；
+    //Identity_1 [1,2016,1] 保存各候选的原始分数。
     cv::dnn::Net loadPalmModel(const std::string &modelPath);
     //这里的 cv::dnn::Net 表示神经网络对象
     //函数接收模型路径，返回加载好的网络。
@@ -34,6 +38,8 @@ namespace neko::vision{
     struct PalmDetection {
         cv::Rect box;
         float score;
+        // 7 个手掌参考点，保存还原到原图后的坐标
+        std::array<cv::Point2f, 7> landmarks{};
     };
     
     // 1. 预处理函数：原始画面 → 模型输入和坐标变换信息
@@ -46,8 +52,8 @@ namespace neko::vision{
         const cv::Mat& inputBlob);
     
 
-    // 3. 解码：推理输出 + 预处理变换信息 + 锚点
-    // → 最终手掌框和分数
+    // 3. 解码函数返回结构体：推理输出 + 预处理变换信息 + 锚点
+    // → 最终手掌框和分数和参考点
     std::vector<PalmDetection> decodePalms(
         const PalmInferenceResult& raw,
         const PalmPreprocessResult& input,

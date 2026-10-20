@@ -1,0 +1,240 @@
+#include "robot_renderer.hpp"
+
+#include <QColor>
+#include <QFont>
+#include <QLinearGradient>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPen>
+#include <QPolygonF>
+#include <QRadialGradient>
+
+#include <algorithm>
+#include <cmath>
+
+namespace neko::desktop {
+namespace {
+
+constexpr double pi = 3.14159265358979323846;
+const QColor outline("#446675");
+const QColor mint("#62efd0");
+const QColor dark("#142d40");
+
+QLinearGradient shellGradient(double top, double bottom)
+{
+    QLinearGradient gradient(0, top, 0, bottom);
+    gradient.setColorAt(0, QColor("#ffffff"));
+    gradient.setColorAt(0.6, QColor("#e6f5f5"));
+    gradient.setColorAt(1, QColor("#bcd7df"));
+    return gradient;
+}
+
+void drawStar(QPainter& painter, QPointF center, double radius)
+{
+    QPolygonF points;
+    for (int i = 0; i < 10; ++i) {
+        const double angle = -pi / 2.0 + i * pi / 5.0;
+        const double length = i % 2 == 0 ? radius : radius * 0.45;
+        points << center + QPointF(std::cos(angle) * length,
+                                   std::sin(angle) * length);
+    }
+    painter.drawPolygon(points);
+}
+
+void drawArm(QPainter& painter, bool right, PetPose pose, double time)
+{
+    painter.save();
+    painter.translate(right ? 162.0 : 78.0, 163.0);
+    const double angle = right && pose == PetPose::Wave
+        ? -118.0 + std::sin(time * 8.0) * 20.0
+        : (right ? -18.0 : 18.0) + std::sin(time * 2.0) * 3.0;
+    painter.rotate(angle);
+
+    painter.setPen(QPen(outline, 2.2, Qt::SolidLine, Qt::RoundCap));
+    painter.setBrush(QColor("#6a94a1"));
+    painter.drawEllipse(QPointF(0, 1), 8, 8);
+    painter.setBrush(shellGradient(0, 39));
+    painter.drawRoundedRect(QRectF(-7, 2, 14, 32), 6, 6);
+    painter.setBrush(QColor("#d7ecec"));
+    painter.drawEllipse(QRectF(-11, 25, 22, 21));
+    painter.setPen(QPen(QColor("#8aaeb7"), 1.5));
+    painter.drawLine(QPointF(-4, 37), QPointF(-4, 42));
+    painter.drawLine(QPointF(3, 37), QPointF(3, 42));
+    painter.restore();
+}
+
+void drawEyes(QPainter& painter, PetPose pose, double time)
+{
+    const bool blink = std::fmod(std::max(0.0, time), 4.8) > 4.62;
+    painter.setPen(QPen(mint, 4, Qt::SolidLine, Qt::RoundCap));
+    painter.setBrush(mint);
+
+    if (pose == PetPose::Sleep || blink) {
+        for (double x : {94.0, 146.0}) {
+            QPainterPath eyelid;
+            eyelid.moveTo(x - 10, 113);
+            eyelid.quadTo(x, 121, x + 10, 113);
+            painter.drawPath(eyelid);
+        }
+    } else if (pose == PetPose::Happy) {
+        for (double x : {94.0, 146.0}) {
+            QPainterPath smile;
+            smile.moveTo(x - 10, 116);
+            smile.quadTo(x, 97, x + 10, 116);
+            painter.drawPath(smile);
+        }
+    } else if (pose == PetPose::Surprise) {
+        painter.setPen(Qt::NoPen);
+        painter.drawEllipse(QPointF(94, 110), 10, 14);
+        painter.drawEllipse(QPointF(146, 110), 10, 14);
+        painter.setBrush(QColor("#eaffff"));
+        painter.drawEllipse(QPointF(91, 105), 3, 4);
+        painter.drawEllipse(QPointF(143, 105), 3, 4);
+    } else {
+        painter.setPen(Qt::NoPen);
+        for (double x : {94.0, 146.0}) {
+            painter.setBrush(mint);
+            painter.drawRoundedRect(QRectF(x - 7, 98, 14, 24), 6, 6);
+            painter.setBrush(QColor("#d8fff7"));
+            painter.drawRoundedRect(QRectF(x - 4, 100, 5, 9), 2, 2);
+        }
+    }
+
+    painter.setPen(QPen(mint, 2.4, Qt::SolidLine, Qt::RoundCap));
+    painter.setBrush(Qt::NoBrush);
+    if (pose == PetPose::Surprise) {
+        painter.drawEllipse(QRectF(116, 125, 8, 9));
+    } else if (pose == PetPose::Sleep) {
+        painter.drawLine(QPointF(117, 130), QPointF(123, 130));
+    } else {
+        QPainterPath mouth;
+        mouth.moveTo(111, 127);
+        mouth.quadTo(120, 137, 129, 127);
+        painter.drawPath(mouth);
+    }
+}
+
+} // namespace
+
+void paintRobot(QPainter& painter, const QRectF& bounds,
+                PetPose pose, double elapsedSeconds)
+{
+    if (bounds.isEmpty()) return;
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const double scale = std::min(bounds.width() / 240.0,
+                                  bounds.height() / 256.0);
+    painter.translate(bounds.center().x() - 120.0 * scale,
+                      bounds.center().y() - 128.0 * scale);
+    painter.scale(scale, scale);
+
+    const double time = std::max(0.0, elapsedSeconds);
+    const bool sleeping = pose == PetPose::Sleep;
+    const double bob = std::sin(time * (sleeping ? 1.4 : 2.2))
+                     * (sleeping ? 1.5 : 3.0);
+
+    // Ground glow stays still while the body breathes above it.
+    QRadialGradient shadow(QPointF(120, 235), 62);
+    shadow.setColorAt(0, QColor(20, 61, 77, 65));
+    shadow.setColorAt(0.65, QColor(20, 61, 77, 22));
+    shadow.setColorAt(1, QColor(20, 61, 77, 0));
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(shadow);
+    painter.drawEllipse(QRectF(58, 226, 124, 18));
+
+    painter.save();
+    painter.translate(0, bob + (sleeping ? 3.0 : 0.0));
+
+    // Feet and articulated arms sit behind the torso.
+    painter.setPen(QPen(outline, 2.4));
+    painter.setBrush(shellGradient(204, 230));
+    painter.drawRoundedRect(QRectF(87, 206, 26, 23), 9, 9);
+    painter.drawRoundedRect(QRectF(127, 206, 26, 23), 9, 9);
+    painter.setPen(QPen(QColor("#82a9b1"), 2, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QPointF(93, 224), QPointF(107, 224));
+    painter.drawLine(QPointF(133, 224), QPointF(147, 224));
+    drawArm(painter, false, pose, time);
+    drawArm(painter, true, pose, time);
+
+    painter.setPen(QPen(outline, 2.5));
+    painter.setBrush(shellGradient(145, 215));
+    painter.drawRoundedRect(QRectF(77, 145, 86, 70), 24, 24);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor("#93b9c2"));
+    painter.drawRoundedRect(QRectF(105, 141, 30, 12), 4, 4);
+
+    // A compact illuminated chest panel gives the robot its own identity.
+    painter.setBrush(dark);
+    painter.drawRoundedRect(QRectF(98, 167, 44, 29), 9, 9);
+    painter.setBrush(QColor("#25485a"));
+    painter.drawRoundedRect(QRectF(102, 171, 36, 21), 6, 6);
+    painter.setPen(QPen(mint, 2.4, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QPointF(111, 181), QPointF(117, 187));
+    painter.drawLine(QPointF(117, 187), QPointF(129, 176));
+    painter.setPen(QPen(QColor("#96b8c0"), 1.5));
+    painter.drawLine(QPointF(110, 205), QPointF(130, 205));
+
+    // Cat-like antenna fins, inset with mint light.
+    painter.setPen(QPen(outline, 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.setBrush(shellGradient(37, 84));
+    painter.drawPolygon(QPolygonF{QPointF(57, 83), QPointF(53, 41), QPointF(91, 67)});
+    painter.drawPolygon(QPolygonF{QPointF(149, 67), QPointF(187, 41), QPointF(183, 83)});
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor("#8ee5d8"));
+    painter.drawPolygon(QPolygonF{QPointF(64, 71), QPointF(62, 56), QPointF(77, 68)});
+    painter.drawPolygon(QPolygonF{QPointF(163, 68), QPointF(178, 56), QPointF(176, 71)});
+
+    painter.setPen(QPen(outline, 2.6));
+    painter.setBrush(shellGradient(62, 153));
+    painter.drawRoundedRect(QRectF(46, 62, 148, 92), 30, 30);
+
+    // Side ports and face bezel.
+    painter.setBrush(QColor("#a9cbd1"));
+    painter.drawRoundedRect(QRectF(39, 94, 12, 28), 5, 5);
+    painter.drawRoundedRect(QRectF(189, 94, 12, 28), 5, 5);
+    painter.setBrush(QColor("#87afb9"));
+    painter.setPen(Qt::NoPen);
+    painter.drawRoundedRect(QRectF(57, 76, 126, 66), 22, 22);
+    QLinearGradient screen(0, 80, 0, 139);
+    screen.setColorAt(0, QColor("#254658"));
+    screen.setColorAt(1, dark);
+    painter.setBrush(screen);
+    painter.drawRoundedRect(QRectF(60, 79, 120, 60), 19, 19);
+    painter.setPen(QPen(QColor(255, 255, 255, 30), 2, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QPointF(77, 86), QPointF(108, 86));
+    drawEyes(painter, pose, time);
+
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(255, 152, 164, pose == PetPose::Happy ? 150 : 85));
+    painter.drawEllipse(QRectF(70, 121, 12, 5));
+    painter.drawEllipse(QRectF(158, 121, 12, 5));
+    painter.setBrush(mint);
+    painter.drawEllipse(QPointF(120, 70), 2, 2);
+
+    if (pose == PetPose::Happy) {
+        painter.setBrush(QColor("#ffe599"));
+        drawStar(painter, QPointF(26, 100 + std::sin(time * 4) * 3), 7);
+        drawStar(painter, QPointF(212, 65 - std::sin(time * 4) * 3), 6);
+    } else if (sleeping) {
+        painter.setPen(QColor("#68a9b4"));
+        QFont font = painter.font();
+        font.setBold(true);
+        font.setPixelSize(14);
+        painter.setFont(font);
+        painter.drawText(QPointF(197, 73 - std::fmod(time * 6.0, 12.0)),
+                         QStringLiteral("z"));
+        font.setPixelSize(19);
+        painter.setFont(font);
+        painter.drawText(QPointF(211, 55 - std::fmod(time * 6.0, 12.0)),
+                         QStringLiteral("z"));
+    } else if (pose == PetPose::Surprise) {
+        painter.setPen(QPen(QColor("#f6c671"), 4, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(208, 63), QPointF(212, 48));
+        painter.drawPoint(QPointF(205, 71));
+    }
+
+    painter.restore();
+    painter.restore();
+}
+
+} // namespace neko::desktop
