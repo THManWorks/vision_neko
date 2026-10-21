@@ -1,2 +1,3 @@
 /build/
 /models/*.onnx
+/docs/learning-notes.md

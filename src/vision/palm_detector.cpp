@@ -2207,6 +2207,7 @@ PalmPreprocessResult preprocessPalmFrame(
             cv::Point(cvRound(x1), cvRound(y1)),
             cv::Point(cvRound(x2), cvRound(y2))
         );//Rect是矩形对象，此处两个参数：左上角、右下角
+        //内部会自动转换成高宽形式
 
         // 将超出画面的部分裁掉
         box = box & cv::Rect(0, 0, input.originalSize.width, input.originalSize.height);

@@ -36,10 +36,9 @@ namespace neko::vision{
 
     // 一只手掌的最终检测结果（解码返回结构体）
     struct PalmDetection {
-        cv::Rect box;
-        float score;
-        // 7 个手掌参考点，保存还原到原图后的坐标
-        std::array<cv::Point2f, 7> landmarks{};
+        cv::Rect box; // 手掌框
+        float score;// 检测分数
+        std::array<cv::Point2f, 7> landmarks{};      // 7 个手掌参考点
     };
     
     // 1. 预处理函数：原始画面 → 模型输入和坐标变换信息
