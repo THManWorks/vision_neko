@@ -21,6 +21,8 @@ add_library(neko_vision_pipeline STATIC
     src/vision/palm_detector.cpp
     src/vision/hand_presence.cpp
     src/vision/hand_pose.cpp
+    src/vision/hand_gesture.cpp
+    src/vision/hand_gesture_state.cpp
 )
 target_compile_features(neko_vision_pipeline PUBLIC cxx_std_17)
 target_include_directories(neko_vision_pipeline PUBLIC

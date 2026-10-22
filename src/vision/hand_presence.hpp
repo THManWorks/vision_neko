@@ -1,4 +1,4 @@
-//手部消失检查
+//手部检测状态更新
 
 
 #pragma once
@@ -23,6 +23,7 @@ namespace neko::vision {
     };
 
     // 根据当前帧的检测结果更新状态(更新函数)
+    // 接收参数：手部存在状态（会被更新）、当前帧是否检测到手。
     HandPresenceEvent updateHandPresence(
         HandPresenceState& state,
         bool hasHandThisFrame);

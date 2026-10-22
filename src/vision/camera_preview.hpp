@@ -1,5 +1,6 @@
 ///.hpp 声明模块提供哪些接口，以及应该怎样使用它们
 //摄像头循环函数
+
 #pragma once
 
 namespace neko::vision{
@@ -7,5 +8,6 @@ namespace neko::vision{
 //这里是嵌套命名空间大空间neko包含小空间vision
 
     //函数声明
+    // 接收参数：摄像头编号（默认使用0号摄像头）。
     int runCameraPreview(int cameraIndex = 0);
 }
