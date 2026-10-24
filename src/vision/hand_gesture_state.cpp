@@ -51,6 +51,10 @@ HandGestureEvent updateHandGesture(
         return HandGestureEvent::FistConfirmed;
     }
 
+    if (currentGesture == HandGesture::Pointing) {
+        return HandGestureEvent::PointingConfirmed;
+    }
+
     return HandGestureEvent::Cleared;
 }
 

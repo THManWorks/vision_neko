@@ -67,7 +67,7 @@ void PetWindow::buildMenuAndTray()
     cameraStatusAction_ = menu_->addAction(QStringLiteral("摄像头：未开启"));
     cameraStatusAction_->setObjectName("cameraStatusAction");
     cameraStatusAction_->setEnabled(false);
-    cameraAction_ = menu_->addAction(QStringLiteral("开启手掌互动"));
+    cameraAction_ = menu_->addAction(QStringLiteral("开启手势互动"));
     cameraAction_->setObjectName("cameraAction");
     cameraAction_->setCheckable(true);
     connect(cameraAction_, &QAction::toggled, this, &PetWindow::cameraRequested);
@@ -148,11 +148,20 @@ void PetWindow::reactTo(VisualEvent event)
     Q_ASSERT(QThread::currentThread() == thread());
     switch (event) {
     case VisualEvent::HandDetected:
+    case VisualEvent::FistConfirmed:
+        // 手出现和握拳暂不对应动作。
+        break;
     case VisualEvent::HandWave:
         showPose(PetPose::Wave);
         break;
     case VisualEvent::HandLost:
         showPose(PetPose::Surprise);
+        break;
+    case VisualEvent::OpenPalmConfirmed:
+        // 动态挥手优先播放完，避免恢复张手分类时抢占挥手动画。
+        if (pose_ != PetPose::Wave || clock_.elapsed() >= poseDeadline_) {
+            showPose(PetPose::Happy);
+        }
         break;
     }
 }

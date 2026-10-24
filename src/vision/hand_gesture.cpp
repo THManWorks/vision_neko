@@ -77,7 +77,7 @@ namespace neko::vision{
         }
 
 
-        //计算指尖比参考关节点离手腕更远
+        //计算指尖是否比参考关节点离手腕更远
         // 接收参数：一只手的姿态解码结果，使用关键点的 x、y 坐标。
         // 返回值：五指的伸展状态，依次为拇指、食指、中指、无名指、小指。
         std::array<bool, 5> calculateFingerStates(
@@ -114,7 +114,7 @@ namespace neko::vision{
     //判断手势函数
     //// 采用官方二维规则，使用关键点的 x、y 判断张手和握拳：
     // 接收参数：一只手的姿态解码结果。
-    // 返回值：张手、握拳或未知。
+    // 返回值：张手、握拳、只伸出食指或未知。
     HandGesture classifyHandGesture(const HandPoseResult& hand){
 
         if (!hand.valid) {
@@ -162,7 +162,23 @@ namespace neko::vision{
             return HandGesture::OpenPalm;
         }
 
-        //两个都不是，就未知
+        // 仅伸食指：拇指弯曲，食指伸直
+        bool pointing =
+            angles[0] > 30.0 &&
+            angles[1] < 49.0 &&
+            extended[1];
+
+        // 中指、无名指、小指均弯曲且未伸展
+        for (int i = 2; i < 5; ++i) {
+            pointing = pointing &&
+                    angles[i] > 65.0 &&
+                    !extended[i];
+        }
+
+        if (pointing) {
+            return HandGesture::Pointing;
+        }
+                //两个都不是，就未知
         return HandGesture::Unknown;
     }
 

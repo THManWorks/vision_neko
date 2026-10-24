@@ -11,6 +11,7 @@ enum class HandGestureEvent {
     None,               // 没有新事件
     OpenPalmConfirmed,  // 刚确认张手
     FistConfirmed,      // 刚确认握拳
+    PointingConfirmed,  // 刚确认仅伸食指
     Cleared             // 已确认的手势被清除，不代表手离开
 };
 

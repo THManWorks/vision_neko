@@ -10,9 +10,9 @@
 
 namespace {
 
-QString defaultModelPath()
+// 接收参数：模型相对于项目目录的路径。
+QString defaultModelPath(const QString& relative)
 {
-    const QString relative = QStringLiteral("models/palm_detection_mediapipe_2023feb.onnx");
     const QDir executableDir(QCoreApplication::applicationDirPath());
     const QStringList candidates{
         executableDir.absoluteFilePath("../" + relative),
@@ -35,7 +35,7 @@ int main(int argc, char** argv)
     app.setQuitOnLastWindowClosed(false);
 
     QCommandLineParser parser;
-    parser.setApplicationDescription(QStringLiteral("Neko 桌面机器人；在右键菜单开启手掌互动。"));
+    parser.setApplicationDescription(QStringLiteral("Neko 桌面机器人；在右键菜单开启手势互动。"));
     parser.addHelpOption();
     parser.addVersionOption();
     parser.addOption({"smoke-test", "Automatically exit after 1.2 seconds."});
@@ -44,6 +44,7 @@ int main(int argc, char** argv)
     parser.addOption({"camera", "Start hand interaction immediately (camera access)."});
     parser.addOption({"camera-index", "Camera device index.", "index", "0"});
     parser.addOption({"model", "Palm detection ONNX model path.", "path"});
+    parser.addOption({"hand-pose-model", "Hand pose ONNX model path.", "path"});
     parser.process(app);
 
     using namespace neko::desktop;
@@ -61,11 +62,27 @@ int main(int argc, char** argv)
     if (!validIndex || cameraIndex < 0) parser.showHelp(2);
 
     PetWindow pet;
-    CameraController camera(CameraOptions{
-        parser.isSet("model") ? QFileInfo(parser.value("model")).absoluteFilePath()
-                              : defaultModelPath(),
-        cameraIndex
-    });
+
+    // 准备摄像头模块需要的配置
+    CameraOptions options;
+
+    options.modelPath =
+        parser.isSet("model")
+            ? QFileInfo(parser.value("model")).absoluteFilePath()
+            : defaultModelPath(
+                QStringLiteral("models/palm_detection_mediapipe_2023feb.onnx"));
+
+    options.cameraIndex = cameraIndex;
+
+    options.handPoseModelPath =
+        parser.isSet("hand-pose-model")
+            ? QFileInfo(parser.value("hand-pose-model")).absoluteFilePath()
+            : defaultModelPath(
+                QStringLiteral("models/handpose_estimation_mediapipe_2023feb.onnx"));
+
+    // 将配置交给摄像头控制器
+    CameraController camera(options);
+
     QObject::connect(&pet, &PetWindow::cameraRequested,
                      &camera, &CameraController::setEnabled);
     QObject::connect(&camera, &CameraController::visualEvent,

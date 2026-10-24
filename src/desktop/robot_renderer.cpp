@@ -41,25 +41,98 @@ void drawStar(QPainter& painter, QPointF center, double radius)
     painter.drawPolygon(points);
 }
 
+// 接收参数：绘图对象、开心动作已播放的秒数。
+void drawHappyBurst(QPainter& painter, double time)
+{
+    constexpr double duration = 1.3;
+    const double progress = std::clamp(time / duration, 0.0, 1.0);
+    if (progress >= 1.0) return;
+    const double spread = 1.0 - std::pow(1.0 - progress, 3.0);
+    const double radius = 35.0 + 66.0 * spread;
+    const double fade = 1.0 - progress;
+    const QPointF center(120, 108 - 10.0 * progress);
+
+    painter.save();
+    painter.setOpacity(0.65 * fade);
+    painter.setPen(QPen(QColor("#f6d88b"), 1.5));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawEllipse(center, radius, radius * 0.82);
+
+    const QColor colors[]{QColor("#f6c671"), mint, QColor("#f3a8bd")};
+    for (int i = 0; i < 12; ++i) {
+        const double angle = -pi / 2.0 + i * pi / 6.0;
+        const QPointF position = center + QPointF(
+            std::cos(angle) * radius,
+            std::sin(angle) * radius * 0.82);
+        painter.save();
+        painter.setOpacity(0.95 * fade);
+        painter.translate(position);
+        painter.rotate(i * 17.0 + progress * 80.0);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(colors[i % 3]);
+        drawStar(painter, QPointF(0, 0), 3.5 + 3.0 * fade);
+        painter.restore();
+    }
+    painter.restore();
+}
+
+// 接收参数：挥手动作已播放的秒数；返回右手掌中心的绘图坐标。
+QPointF waveHandCenter(double time)
+{
+    const double angle = (-118.0 + std::sin(time * 8.0) * 20.0) * pi / 180.0;
+    return QPointF(162.0 - 45.5 * std::sin(angle),
+                   163.0 + 45.5 * std::cos(angle));
+}
+
+// 接收参数：绘图对象、挥手动作已播放的秒数。
+void drawWaveTrail(QPainter& painter, double time)
+{
+    painter.save();
+    painter.setPen(Qt::NoPen);
+    const double appear = std::clamp(time / 0.2, 0.0, 1.0);
+    for (int i = 10; i >= 1; --i) {
+        const double previousTime = time - i * 0.035;
+        if (previousTime < 0.0) continue;
+        const double strength = (11.0 - i) / 10.0;
+        const QPointF position = waveHandCenter(previousTime);
+        painter.setBrush(QColor(87, 209, 241,
+                                static_cast<int>(155.0 * strength * appear)));
+        const double radius = 2.0 + 3.0 * strength;
+        painter.drawEllipse(position, radius, radius);
+    }
+
+    const QPointF position = waveHandCenter(time);
+    const double phase = std::fmod(time, 0.65) / 0.65;
+    painter.setPen(QPen(QColor(98, 239, 208,
+                              static_cast<int>(180.0 * (1.0 - phase) * appear)), 1.6));
+    painter.setBrush(Qt::NoBrush);
+    const double radius = 11.0 + phase * 12.0;
+    painter.drawEllipse(position, radius, radius);
+    painter.restore();
+}
+
 void drawArm(QPainter& painter, bool right, PetPose pose, double time)
 {
     painter.save();
     painter.translate(right ? 162.0 : 78.0, 163.0);
-    const double angle = right && pose == PetPose::Wave
+    const bool waving = right && pose == PetPose::Wave;
+    const double angle = waving
         ? -118.0 + std::sin(time * 8.0) * 20.0
         : (right ? -18.0 : 18.0) + std::sin(time * 2.0) * 3.0;
     painter.rotate(angle);
+    // 挥手时伸出手臂，让手掌和光点露在头部外侧。
+    const double handOffset = waving ? 10.0 : 0.0;
 
     painter.setPen(QPen(outline, 2.2, Qt::SolidLine, Qt::RoundCap));
     painter.setBrush(QColor("#6a94a1"));
     painter.drawEllipse(QPointF(0, 1), 8, 8);
     painter.setBrush(shellGradient(0, 39));
-    painter.drawRoundedRect(QRectF(-7, 2, 14, 32), 6, 6);
+    painter.drawRoundedRect(QRectF(-7, 2, 14, 32 + handOffset), 6, 6);
     painter.setBrush(QColor("#d7ecec"));
-    painter.drawEllipse(QRectF(-11, 25, 22, 21));
+    painter.drawEllipse(QRectF(-11, 25 + handOffset, 22, 21));
     painter.setPen(QPen(QColor("#8aaeb7"), 1.5));
-    painter.drawLine(QPointF(-4, 37), QPointF(-4, 42));
-    painter.drawLine(QPointF(3, 37), QPointF(3, 42));
+    painter.drawLine(QPointF(-4, 37 + handOffset), QPointF(-4, 42 + handOffset));
+    painter.drawLine(QPointF(3, 37 + handOffset), QPointF(3, 42 + handOffset));
     painter.restore();
 }
 
@@ -143,7 +216,12 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.drawEllipse(QRectF(58, 226, 124, 18));
 
     painter.save();
-    painter.translate(0, bob + (sleeping ? 3.0 : 0.0));
+    const double happyBounce = pose == PetPose::Happy && time < 0.65
+        ? -7.0 * std::sin(pi * time / 0.65) : 0.0;
+    painter.translate(0, bob + happyBounce + (sleeping ? 3.0 : 0.0));
+
+    if (pose == PetPose::Happy) drawHappyBurst(painter, time);
+    else if (pose == PetPose::Wave) drawWaveTrail(painter, time);
 
     // Feet and articulated arms sit behind the torso.
     painter.setPen(QPen(outline, 2.4));

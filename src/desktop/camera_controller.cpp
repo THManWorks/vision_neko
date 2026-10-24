@@ -1,6 +1,9 @@
 #include "camera_controller.hpp"
 
 #include "hand_presence.hpp"
+#include "hand_pose.hpp"
+#include "hand_gesture_state.hpp"
+#include "hand_wave.hpp"
 #include "palm_detector.hpp"
 
 #include <QDebug>
@@ -12,6 +15,7 @@
 
 #include <stdexcept>
 #include <utility>
+#include <chrono>
 
 namespace neko::desktop {
 namespace {
@@ -35,18 +39,26 @@ public:
         // Validate before accessing hardware, including when launched outside
         // the project directory.
         if (!QFileInfo(options_.modelPath).isFile()) {
-            throw CameraFailure(QStringLiteral("模型文件不存在，请检查 models 文件夹"));
+            throw CameraFailure(QStringLiteral("手掌检测模型文件不存在，请检查 models 文件夹"));
+        }
+        if (!QFileInfo(options_.handPoseModelPath).isFile()) {
+            throw CameraFailure(QStringLiteral("手部姿态模型文件不存在，请检查 models 文件夹"));
         }
         model_ = vision::loadPalmModel(options_.modelPath.toStdString());
+        if (QThread::currentThread()->isInterruptionRequested()) return;
+        handPoseModel_ = vision::loadHandPoseModel(options_.handPoseModelPath.toStdString());
         anchors_ = vision::createPalmAnchors();
         if (QThread::currentThread()->isInterruptionRequested()) return;
         if (!camera_.open(options_.cameraIndex, cv::CAP_DSHOW)) {
             throw CameraFailure(QStringLiteral("无法打开摄像头，请检查连接或是否被占用"));
         }
+        clockStart_ = std::chrono::steady_clock::now();
     }
 
-    bool readPresence(bool& hasHand) override
+    // 接收参数：用于接收这一帧的存在情况、汇总手势、单手姿态和时间。
+    bool readFrame(CameraFrameResult& result) override
     {
+        result = CameraFrameResult{};
         cv::Mat frame;
         if (!camera_.read(frame) || frame.empty()) return false;
         cv::flip(frame, frame, 1);
@@ -55,15 +67,38 @@ public:
         const auto input = vision::preprocessPalmFrame(frame);
         const auto raw = vision::runPalmInference(model_, input.inputBlob);
         const auto detections = vision::decodePalms(raw, input, anchors_);
-        hasHand = !detections.empty();
+        result.hasHand = !detections.empty();
+        result.handCount = static_cast<int>(detections.size());
+
+        bool hasOpenPalm = false;
+        bool hasFist = false;
+        for (const auto& palm : detections) {
+            if (QThread::currentThread()->isInterruptionRequested()) return true;
+            const auto handInput = vision::preprocessHandPose(frame, palm);
+            if (handInput.inputBlob.empty()) continue;
+            const auto handRaw = vision::runHandPoseInference(handPoseModel_, handInput.inputBlob);
+            const auto hand = vision::decodeHandPose(handRaw, handInput);
+            const auto gesture = vision::classifyHandGesture(hand);
+            if (result.handCount == 1) result.singleHand = hand;
+            hasOpenPalm |= gesture == vision::HandGesture::OpenPalm;
+            hasFist |= gesture == vision::HandGesture::Fist;
+        }
+
+        // 与视觉预览一致：张手和握拳冲突，或均未识别时，采用 Unknown。
+        if (hasOpenPalm && !hasFist) result.gesture = vision::HandGesture::OpenPalm;
+        else if (hasFist && !hasOpenPalm) result.gesture = vision::HandGesture::Fist;
+        result.timeSeconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - clockStart_).count();
         return true;
     }
 
 private:
     CameraOptions options_;
     cv::dnn::Net model_;
+    cv::dnn::Net handPoseModel_;
     std::vector<cv::Point2f> anchors_;
     cv::VideoCapture camera_;
+    std::chrono::steady_clock::time_point clockStart_;
 };
 
 } // namespace
@@ -80,6 +115,8 @@ public:
 signals:
     void ready();
     void presenceChanged(bool present);
+    // 接收参数：视觉模块确认后，准备发送给桌面的静态或动态手势事件。
+    void gestureConfirmed(neko::desktop::VisualEvent event);
     void failed(const QString& message);
 
 protected:
@@ -94,18 +131,46 @@ protected:
             emit ready();
 
             vision::HandPresenceState state;
+            vision::HandGestureState gestureState;
+            vision::HandWaveState waveState;
             while (!isInterruptionRequested()) {
-                bool hasHand = false;
-                if (!session->readPresence(hasHand)) {
+                CameraFrameResult frame;
+                if (!session->readFrame(frame)) {
                     if (!isInterruptionRequested()) {
                         throw CameraFailure(QStringLiteral("摄像头读取中断，请关闭后重新开启"));
                     }
                     break;
                 }
                 if (isInterruptionRequested()) break;
-                const auto event = vision::updateHandPresence(state, hasHand);
+                const auto event = vision::updateHandPresence(state, frame.hasHand);
                 if (event == vision::HandPresenceEvent::Appeared) emit presenceChanged(true);
                 else if (event == vision::HandPresenceEvent::Disappeared) emit presenceChanged(false);
+
+                // 无手帧同样更新，用于清除旧手势并允许下次重新确认。
+                const auto gestureEvent = vision::updateHandGesture(
+                    gestureState, frame.hasHand ? frame.gesture : vision::HandGesture::Unknown);
+                if (gestureEvent == vision::HandGestureEvent::OpenPalmConfirmed) {
+                    emit gestureConfirmed(VisualEvent::OpenPalmConfirmed);
+                } else if (gestureEvent == vision::HandGestureEvent::FistConfirmed) {
+                    emit gestureConfirmed(VisualEvent::FistConfirmed);
+                }
+                // Cleared 仅清除内部状态，避免覆盖“手离开”的惊讶动作。
+
+                // 与预览一致：多手立即重置，短暂缺失由视觉函数处理。
+                if (frame.handCount > 1) {
+                    waveState.initialized = false;
+                    waveState.direction = vision::HandMoveDirection::None;
+                    waveState.turnCount = 0;
+                }
+                const bool singleHand = frame.hasHand && frame.handCount == 1;
+                const auto waveEvent = vision::updateHandWave(
+                    waveState,
+                    singleHand ? frame.singleHand : vision::HandPoseResult{},
+                    singleHand ? frame.gesture : vision::HandGesture::Unknown,
+                    frame.timeSeconds);
+                if (waveEvent == vision::HandWaveEvent::Waved) {
+                    emit gestureConfirmed(VisualEvent::HandWave);
+                }
             }
         } catch (const CameraFailure& error) {
             if (!isInterruptionRequested()) emit failed(error.message());
@@ -156,12 +221,17 @@ void CameraController::start()
 
     connect(worker, &CameraWorker::ready, this, [this, worker] {
         if (worker_ == worker && active_ && !stopping_) {
-            emit statusChanged(QStringLiteral("正在检测手掌"));
+            emit statusChanged(QStringLiteral("正在识别手势"));
         }
     }, Qt::QueuedConnection);
     connect(worker, &CameraWorker::presenceChanged, this, [this, worker](bool present) {
         if (worker_ == worker && active_ && !stopping_) {
             emit visualEvent(present ? VisualEvent::HandDetected : VisualEvent::HandLost);
+        }
+    }, Qt::QueuedConnection);
+    connect(worker, &CameraWorker::gestureConfirmed, this, [this, worker](VisualEvent event) {
+        if (worker_ == worker && active_ && !stopping_) {
+            emit visualEvent(event);
         }
     }, Qt::QueuedConnection);
     connect(worker, &CameraWorker::failed, this, [this, worker](const QString& message) {

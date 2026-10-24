@@ -11,7 +11,8 @@ namespace neko::vision {
 enum class HandGesture {
     Unknown,   // 尚未识别出支持的手势
     OpenPalm,  // 张开手掌
-    Fist       // 握拳
+    Fist,       // 握拳
+    Pointing   // 仅伸出食指，其余手指闭合
 };
 
 

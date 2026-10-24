@@ -1,6 +1,7 @@
 #pragma once
 
 #include "visual_event.hpp"
+#include "hand_gesture.hpp"
 
 #include <QObject>
 #include <QString>
@@ -11,17 +12,29 @@
 namespace neko::desktop {
 
 struct CameraOptions {
-    QString modelPath;
-    int cameraIndex = 0;
+    QString modelPath;         // 手掌检测模型路径
+    int cameraIndex = 0;       // 摄像头编号
+    QString handPoseModelPath; // 手部姿态模型路径
 };
 
-// One session belongs entirely to the capture thread. Tests can supply frames
-// as presence values without accessing a physical camera.
+// 一帧的视觉结果；静态手势已汇总多只手，单手姿态供动态挥手判断。
+struct CameraFrameResult {
+    bool hasHand = false;
+    vision::HandGesture gesture = vision::HandGesture::Unknown;
+    int handCount = 0;
+    vision::HandPoseResult singleHand; // 只有一只手时提供，默认无效
+    double timeSeconds = 0.0;         // 本次会话开始后的单调时间，单位为秒
+};
+
+// One session belongs entirely to the capture thread. Tests can supply frame
+// results without accessing a physical camera.
 class CameraSession {
 public:
     virtual ~CameraSession() = default;
     virtual void open() = 0;
-    virtual bool readPresence(bool& hasHand) = 0;
+    // 接收参数：用于接收当前帧的存在情况、静态手势、单手姿态和时间。
+    // 返回值：是否成功读取并处理一帧。
+    virtual bool readFrame(CameraFrameResult& result) = 0;
 };
 
 using CameraSessionFactory = std::function<std::unique_ptr<CameraSession>()>;

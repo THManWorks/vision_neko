@@ -46,9 +46,31 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(pet.pose() == PetPose::Idle, 3000);
         pet.showPose(PetPose::Sleep);
         pet.reactTo(VisualEvent::HandDetected);
-        QCOMPARE(pet.pose(), PetPose::Wave);
+        QCOMPARE(pet.pose(), PetPose::Sleep);
         pet.reactTo(VisualEvent::HandLost);
         QCOMPARE(pet.pose(), PetPose::Surprise);
+        pet.reactTo(VisualEvent::OpenPalmConfirmed);
+        QCOMPARE(pet.pose(), PetPose::Happy);
+        pet.showPose(PetPose::Sleep);
+        pet.reactTo(VisualEvent::FistConfirmed);
+        QCOMPARE(pet.pose(), PetPose::Sleep);
+    }
+
+    void waveKeepsPriorityUntilItsAnimationFinishes()
+    {
+        PetWindow pet;
+        pet.show();
+        pet.reactTo(VisualEvent::HandWave);
+        QCOMPARE(pet.pose(), PetPose::Wave);
+        for (auto event : {VisualEvent::OpenPalmConfirmed,
+                           VisualEvent::FistConfirmed, VisualEvent::HandDetected}) {
+            pet.reactTo(event);
+            QCOMPARE(pet.pose(), PetPose::Wave);
+        }
+
+        QTRY_VERIFY_WITH_TIMEOUT(pet.pose() == PetPose::Idle, 3000);
+        pet.reactTo(VisualEvent::OpenPalmConfirmed);
+        QCOMPARE(pet.pose(), PetPose::Happy);
     }
 
     void dragDoesNotClickAndStaysOnScreen()

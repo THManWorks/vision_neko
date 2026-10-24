@@ -23,6 +23,7 @@ add_library(neko_vision_pipeline STATIC
     src/vision/hand_pose.cpp
     src/vision/hand_gesture.cpp
     src/vision/hand_gesture_state.cpp
+    src/vision/hand_wave.cpp
 )
 target_compile_features(neko_vision_pipeline PUBLIC cxx_std_17)
 target_include_directories(neko_vision_pipeline PUBLIC
@@ -64,8 +65,8 @@ if(NEKO_BUILD_DESKTOP)
     set_target_properties(neko_desktop_camera PROPERTIES AUTOMOC ON)
     target_compile_features(neko_desktop_camera PUBLIC cxx_std_17)
     target_include_directories(neko_desktop_camera PUBLIC src/desktop)
-    target_link_libraries(neko_desktop_camera PUBLIC Qt6::Core
-        PRIVATE neko_vision_pipeline opencv_videoio)
+    target_link_libraries(neko_desktop_camera PUBLIC Qt6::Core neko_vision_pipeline
+        PRIVATE opencv_videoio)
 
     # WIN32 让桌面程序启动时不附带控制台窗口。
     add_executable(neko_desktop WIN32 src/desktop/desktop_main.cpp)
