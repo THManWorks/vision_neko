@@ -7,6 +7,7 @@
 #include <QGuiApplication>
 #include <QHideEvent>
 #include <QIcon>
+#include <QLabel>
 #include <QMenu>
 #include <QMouseEvent>
 #include <QPainter>
@@ -20,6 +21,7 @@
 #include <QTimer>
 
 #include <algorithm>
+#include <cmath>
 
 namespace neko::desktop {
 
@@ -31,6 +33,16 @@ PetWindow::PetWindow(QWidget* parent) : QWidget(parent)
     setAttribute(Qt::WA_TranslucentBackground);
     setFixedSize(260, 300);
     setCursor(Qt::OpenHandCursor);
+
+    gazeStatusLabel_ = new QLabel(QStringLiteral("食指带路中"), this);
+    gazeStatusLabel_->setObjectName("gazeStatusLabel");
+    gazeStatusLabel_->setGeometry(54, 0, 152, 24);
+    gazeStatusLabel_->setAlignment(Qt::AlignCenter);
+    gazeStatusLabel_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    gazeStatusLabel_->setStyleSheet(QStringLiteral(
+        "QLabel { color: #255778; background: #e6f6ff; border: 1px solid #7bcdf3;"
+        "border-radius: 11px; font-size: 13px; font-weight: 600; }"));
+    gazeStatusLabel_->hide();
 
     clock_.start();
     timer_ = new QTimer(this);
@@ -115,6 +127,13 @@ void PetWindow::setCameraStatus(const QString& status)
 void PetWindow::setCameraControls(bool checked, bool enabled)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    // 每次重新开启互动才允许新的欢迎动作；手离开不会重新计数。
+    if (checked && !cameraSessionActive_) greetedThisSession_ = false;
+    cameraSessionActive_ = checked;
+    if (!checked) {
+        handLostPending_ = false;
+        setGazeTarget(false, QPointF(0.5, 0.5));
+    }
     const QSignalBlocker blocker(cameraAction_);
     cameraAction_->setChecked(checked);
     cameraAction_->setEnabled(enabled);
@@ -122,10 +141,114 @@ void PetWindow::setCameraControls(bool checked, bool enabled)
 
 void PetWindow::tick()
 {
-    if (poseDeadline_ > 0 && clock_.elapsed() >= poseDeadline_) {
+    const qint64 now = clock_.elapsed();
+    // 推理或设备暂时卡住时，也不能让目光一直停在旧位置。
+    if (gazeActive_ && now - gazeUpdated_ >= 500) {
+        setGazeTarget(false, QPointF(0.5, 0.5));
+    }
+    const double deltaSeconds = std::clamp((now - lastTick_) / 1000.0, 0.0, 0.1);
+    lastTick_ = now;
+    const double blend = 1.0 - std::exp(-deltaSeconds / 0.10);
+    gazePosition_ += (gazeTarget_ - gazePosition_) * blend;
+    if (std::hypot(gazeTarget_.x() - gazePosition_.x(),
+                   gazeTarget_.y() - gazePosition_.y()) < 0.001) {
+        gazePosition_ = gazeTarget_;
+    }
+    const bool playingWave = pose_ == PetPose::Wave && now < poseDeadline_;
+    if (handLostPending_ && !gazeActive_ && !playingWave) {
+        handLostPending_ = false;
+        playPose(PetPose::Surprise, 2200);
+    } else if (poseDeadline_ > 0 && now >= poseDeadline_) {
         playPose(PetPose::Idle, 0);
     }
+    updateFollowMotion(deltaSeconds, now);
     update();
+}
+
+void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
+{
+    followMotion_.running = false;
+    if (!gazeActive_ || !isVisible()) {
+        followPosition_ = QPointF(pos());
+        return;
+    }
+    // 鼠标操作优先；挥手动画播放期间也不追逐。
+    if (pressed_ || menu_->isVisible() || pose_ == PetPose::Wave) {
+        followPosition_ = QPointF(pos());
+        gazeStatusLabel_->setText(pose_ == PetPose::Wave
+            ? QStringLiteral("挥完就来！") : QStringLiteral("等你继续指路"));
+        return;
+    }
+    // 没有新的真实坐标时先停步；原有500ms超时负责退出跟随。
+    if (now - gazeUpdated_ > 180) {
+        followPosition_ = QPointF(pos());
+        gazeStatusLabel_->setText(QStringLiteral("等你继续指路"));
+        return;
+    }
+    if (!followScreen_) {
+        followScreen_ = QGuiApplication::screenAt(frameGeometry().center());
+        if (!followScreen_) followScreen_ = QGuiApplication::primaryScreen();
+    }
+    if (!followScreen_) return;
+    const QRect area = followScreen_->availableGeometry();
+    const double maxX = area.left() + std::max(0, area.width() - width());
+    const double maxY = area.top() + std::max(0, area.height() - height());
+    const QPointF target(
+        area.left() + gazeTarget_.x() * std::max(0, area.width() - width()),
+        area.top() + gazeTarget_.y() * std::max(0, area.height() - height()));
+    // 同步手动拖动、屏幕变化或窗口管理器造成的位置改变。
+    if (std::hypot(x() - followPosition_.x(), y() - followPosition_.y()) > 2.0) {
+        followPosition_ = QPointF(pos());
+    }
+    const QPointF difference = target - followPosition_;
+    const double distance = std::hypot(difference.x(), difference.y());
+    if (distance <= 10.0 || deltaSeconds <= 0.0) {
+        gazeStatusLabel_->setText(QStringLiteral("跟上啦，继续指路"));
+        return;
+    }
+    // 限速并在接近目标时减速，避免瞬移和小幅坐标抖动。
+    const double travel = std::min({distance, 700.0 * deltaSeconds,
+        distance * (1.0 - std::exp(-deltaSeconds / 0.16))});
+    const QPointF step = difference * (travel / distance);
+    followPosition_ += step;
+    followPosition_.setX(std::clamp(followPosition_.x(), static_cast<double>(area.left()), maxX));
+    followPosition_.setY(std::clamp(followPosition_.y(), static_cast<double>(area.top()), maxY));
+    move(qRound(followPosition_.x()), qRound(followPosition_.y()));
+    followMotion_.running = travel > 0.1;
+    if (std::abs(step.x()) > 0.1) followMotion_.direction = step.x() > 0.0 ? 1.0 : -1.0;
+    followMotion_.phase = std::fmod(followMotion_.phase + travel / 30.0, 2.0 * 3.141592653589793);
+    gazeStatusLabel_->setText(QStringLiteral("追着食指跑！"));
+}
+
+void PetWindow::setGazeTarget(bool active, const QPointF& position)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    active = active && std::isfinite(position.x()) && std::isfinite(position.y());
+    const bool changed = gazeActive_ != active;
+    gazeActive_ = active;
+    gazeStatusLabel_->setVisible(active);
+    gazeTarget_ = active
+        ? QPointF(std::clamp(position.x(), 0.0, 1.0),
+                  std::clamp(position.y(), 0.0, 1.0))
+        : QPointF(0.5, 0.5);
+    gazeUpdated_ = clock_.elapsed();
+    if (changed) {
+        followPosition_ = QPointF(pos());
+        followMotion_ = FollowMotion{};
+        if (active) {
+            followScreen_ = QGuiApplication::screenAt(frameGeometry().center());
+            if (!followScreen_) followScreen_ = QGuiApplication::primaryScreen();
+            gazeStatusLabel_->setText(QStringLiteral("食指带路中"));
+        } else {
+            followScreen_.clear();
+        }
+    }
+    if (active) handLostPending_ = false;
+    // 张手后的开心闭眼、睡眠等会遮住跟随效果；挥手动画仍优先播放完。
+    if (active && pose_ != PetPose::Idle && pose_ != PetPose::Wave) {
+        playPose(PetPose::Idle, 0);
+    }
+    if (changed) emit gazeModeChanged(active);
 }
 
 void PetWindow::playPose(PetPose pose, int durationMs)
@@ -134,11 +257,13 @@ void PetWindow::playPose(PetPose pose, int durationMs)
     pose_ = pose;
     poseStarted_ = clock_.elapsed();
     poseDeadline_ = durationMs > 0 ? poseStarted_ + durationMs : 0;
+    emit poseChanged();
     update();
 }
 
 void PetWindow::showPose(PetPose pose)
 {
+    handLostPending_ = false;
     playPose(pose, pose == PetPose::Idle || pose == PetPose::Sleep ? 0 : 2200);
 }
 
@@ -148,20 +273,32 @@ void PetWindow::reactTo(VisualEvent event)
     Q_ASSERT(QThread::currentThread() == thread());
     switch (event) {
     case VisualEvent::HandDetected:
+        handLostPending_ = false;
+        if (cameraSessionActive_ && !greetedThisSession_) {
+            greetedThisSession_ = true;
+            showPose(PetPose::Happy);
+        }
+        break;
     case VisualEvent::FistConfirmed:
-        // 手出现和握拳暂不对应动作。
+        // 握拳暂不对应动作。
+        setGazeTarget(false, QPointF(0.5, 0.5));
         break;
     case VisualEvent::HandWave:
+        setGazeTarget(false, QPointF(0.5, 0.5));
         showPose(PetPose::Wave);
         break;
     case VisualEvent::HandLost:
+        // 短暂丢手不能立刻覆盖已经触发的挥手或正在容错的跟随。
+        if (gazeActive_ || (pose_ == PetPose::Wave && clock_.elapsed() < poseDeadline_)) {
+            handLostPending_ = true;
+            break;
+        }
+        setGazeTarget(false, QPointF(0.5, 0.5));
         showPose(PetPose::Surprise);
         break;
     case VisualEvent::OpenPalmConfirmed:
-        // 动态挥手优先播放完，避免恢复张手分类时抢占挥手动画。
-        if (pose_ != PetPose::Wave || clock_.elapsed() >= poseDeadline_) {
-            showPose(PetPose::Happy);
-        }
+        setGazeTarget(false, QPointF(0.5, 0.5));
+        // 张手只参与视觉判断，不再触发开心，避免和动态挥手交替。
         break;
     }
 }
@@ -182,6 +319,8 @@ void PetWindow::constrainToScreen()
     const int maxX = std::max(area.left(), area.right() - width() + 1);
     const int maxY = std::max(area.top(), area.bottom() - height() + 1);
     move(std::clamp(x(), area.left(), maxX), std::clamp(y(), area.top(), maxY));
+    followPosition_ = QPointF(pos());
+    if (gazeActive_) followScreen_ = screen;
 }
 
 void PetWindow::paintEvent(QPaintEvent*)
@@ -189,9 +328,11 @@ void PetWindow::paintEvent(QPaintEvent*)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     const double elapsed = (clock_.elapsed() - poseStarted_) / 1000.0;
-    paintRobot(painter, QRectF(10, 24, 240, 256), pose_, elapsed);
+    paintRobot(painter, QRectF(10, 24, 240, 256), pose_, elapsed,
+               gazePosition_, gazeActive_, followMotion_);
 
-    if (pose_ == PetPose::Happy || pose_ == PetPose::Wave || pose_ == PetPose::Surprise) {
+    if (!gazeActive_ &&
+        (pose_ == PetPose::Happy || pose_ == PetPose::Wave || pose_ == PetPose::Surprise)) {
         QString text = pose_ == PetPose::Wave ? QStringLiteral("你好呀！")
                      : pose_ == PetPose::Happy ? QStringLiteral("今天也一起加油")
                                               : QStringLiteral("咦？");
@@ -240,12 +381,14 @@ void PetWindow::contextMenuEvent(QContextMenuEvent* event)
 
 void PetWindow::showEvent(QShowEvent* event)
 {
+    lastTick_ = clock_.elapsed();
     timer_->start();
     QWidget::showEvent(event);
 }
 
 void PetWindow::hideEvent(QHideEvent* event)
 {
+    followMotion_.running = false;
     timer_->stop();
     QWidget::hideEvent(event);
 }

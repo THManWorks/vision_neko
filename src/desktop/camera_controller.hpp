@@ -4,6 +4,7 @@
 #include "hand_gesture.hpp"
 
 #include <QObject>
+#include <QPointF>
 #include <QString>
 
 #include <functional>
@@ -24,6 +25,7 @@ struct CameraFrameResult {
     int handCount = 0;
     vision::HandPoseResult singleHand; // 只有一只手时提供，默认无效
     double timeSeconds = 0.0;         // 本次会话开始后的单调时间，单位为秒
+    cv::Size frameSize;               // 单手关键点所在的完整画面尺寸
 };
 
 // One session belongs entirely to the capture thread. Tests can supply frame
@@ -54,9 +56,13 @@ public:
 
     void setEnabled(bool enabled);
     void shutdown();
+    void setDiagnosticsEnabled(bool enabled) { diagnosticsEnabled_ = enabled; }
 
 signals:
     void visualEvent(neko::desktop::VisualEvent event);
+    // 接收参数：是否跟随、0～1的画面位置；不携带图像或OpenCV对象。
+    void gazeChanged(bool active, const QPointF& position);
+    void frameDiagnostics(const QString& record);
     void statusChanged(const QString& status);
     void controlsChanged(bool checked, bool enabled);
 
@@ -69,6 +75,7 @@ private:
     bool active_ = false;
     bool stopping_ = false;
     bool failed_ = false;
+    bool diagnosticsEnabled_ = false;
 };
 
 } // namespace neko::desktop

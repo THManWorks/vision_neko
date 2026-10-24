@@ -111,14 +111,17 @@ void drawWaveTrail(QPainter& painter, double time)
     painter.restore();
 }
 
-void drawArm(QPainter& painter, bool right, PetPose pose, double time)
+void drawArm(QPainter& painter, bool right, PetPose pose, double time,
+             bool running, double runPhase)
 {
     painter.save();
     painter.translate(right ? 162.0 : 78.0, 163.0);
     const bool waving = right && pose == PetPose::Wave;
     const double angle = waving
         ? -118.0 + std::sin(time * 8.0) * 20.0
-        : (right ? -18.0 : 18.0) + std::sin(time * 2.0) * 3.0;
+        : (right ? -18.0 : 18.0) + (running
+            ? std::sin(runPhase + (right ? 0.0 : pi)) * 28.0
+            : std::sin(time * 2.0) * 3.0);
     painter.rotate(angle);
     // 挥手时伸出手臂，让手掌和光点露在头部外侧。
     const double handOffset = waving ? 10.0 : 0.0;
@@ -136,11 +139,21 @@ void drawArm(QPainter& painter, bool right, PetPose pose, double time)
     painter.restore();
 }
 
-void drawEyes(QPainter& painter, PetPose pose, double time)
+void drawEyes(QPainter& painter, PetPose pose, double time, const QPointF& gaze,
+              bool following)
 {
+    painter.save();
+    const double x = std::isfinite(gaze.x()) ? std::clamp(gaze.x(), 0.0, 1.0) : 0.5;
+    const double y = std::isfinite(gaze.y()) ? std::clamp(gaze.y(), 0.0, 1.0) : 0.5;
+    // 只移动屏幕里的眼睛，嘴和身体保持原有动画。
+    painter.translate(following ? std::clamp((x - 0.5) * 32.0, -10.0, 10.0)
+                                : (x - 0.5) * 16.0,
+                      following ? std::clamp((y - 0.5) * 20.0, -7.0, 7.0)
+                                : (y - 0.5) * 10.0);
     const bool blink = std::fmod(std::max(0.0, time), 4.8) > 4.62;
-    painter.setPen(QPen(mint, 4, Qt::SolidLine, Qt::RoundCap));
-    painter.setBrush(mint);
+    const QColor eyeColor = following ? QColor("#76d5ff") : mint;
+    painter.setPen(QPen(eyeColor, 4, Qt::SolidLine, Qt::RoundCap));
+    painter.setBrush(eyeColor);
 
     if (pose == PetPose::Sleep || blink) {
         for (double x : {94.0, 146.0}) {
@@ -166,13 +179,14 @@ void drawEyes(QPainter& painter, PetPose pose, double time)
     } else {
         painter.setPen(Qt::NoPen);
         for (double x : {94.0, 146.0}) {
-            painter.setBrush(mint);
+            painter.setBrush(eyeColor);
             painter.drawRoundedRect(QRectF(x - 7, 98, 14, 24), 6, 6);
             painter.setBrush(QColor("#d8fff7"));
             painter.drawRoundedRect(QRectF(x - 4, 100, 5, 9), 2, 2);
         }
     }
 
+    painter.restore();
     painter.setPen(QPen(mint, 2.4, Qt::SolidLine, Qt::RoundCap));
     painter.setBrush(Qt::NoBrush);
     if (pose == PetPose::Surprise) {
@@ -190,7 +204,8 @@ void drawEyes(QPainter& painter, PetPose pose, double time)
 } // namespace
 
 void paintRobot(QPainter& painter, const QRectF& bounds,
-                PetPose pose, double elapsedSeconds)
+                PetPose pose, double elapsedSeconds, const QPointF& gazePosition,
+                bool following, const FollowMotion& motion)
 {
     if (bounds.isEmpty()) return;
     painter.save();
@@ -203,6 +218,9 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
 
     const double time = std::max(0.0, elapsedSeconds);
     const bool sleeping = pose == PetPose::Sleep;
+    const bool running = following && motion.running && !sleeping && pose != PetPose::Wave;
+    const double runPhase = std::isfinite(motion.phase) ? motion.phase : 0.0;
+    const double direction = motion.direction < 0.0 ? -1.0 : 1.0;
     const double bob = std::sin(time * (sleeping ? 1.4 : 2.2))
                      * (sleeping ? 1.5 : 3.0);
 
@@ -218,21 +236,39 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.save();
     const double happyBounce = pose == PetPose::Happy && time < 0.65
         ? -7.0 * std::sin(pi * time / 0.65) : 0.0;
-    painter.translate(0, bob + happyBounce + (sleeping ? 3.0 : 0.0));
+    const double runningBounce = running ? -5.0 * std::abs(std::sin(runPhase)) : 0.0;
+    painter.translate(0, bob + happyBounce + runningBounce + (sleeping ? 3.0 : 0.0));
+    if (running) {
+        painter.translate(120, 190);
+        painter.rotate(direction * 5.0);
+        painter.translate(-120, -190);
+        painter.setPen(QPen(QColor(118, 213, 255, 130), 2.0, Qt::SolidLine, Qt::RoundCap));
+        for (int i = 0; i < 3; ++i) {
+            const double trailX = 120 - direction * (60 + i * 9);
+            painter.drawLine(QPointF(trailX, 215 - i * 5),
+                             QPointF(trailX - direction * 12, 215 - i * 5));
+        }
+    }
 
     if (pose == PetPose::Happy) drawHappyBurst(painter, time);
     else if (pose == PetPose::Wave) drawWaveTrail(painter, time);
 
     // Feet and articulated arms sit behind the torso.
-    painter.setPen(QPen(outline, 2.4));
-    painter.setBrush(shellGradient(204, 230));
-    painter.drawRoundedRect(QRectF(87, 206, 26, 23), 9, 9);
-    painter.drawRoundedRect(QRectF(127, 206, 26, 23), 9, 9);
-    painter.setPen(QPen(QColor("#82a9b1"), 2, Qt::SolidLine, Qt::RoundCap));
-    painter.drawLine(QPointF(93, 224), QPointF(107, 224));
-    painter.drawLine(QPointF(133, 224), QPointF(147, 224));
-    drawArm(painter, false, pose, time);
-    drawArm(painter, true, pose, time);
+    for (int leg = 0; leg < 2; ++leg) {
+        painter.save();
+        const double phase = runPhase + leg * pi;
+        if (running) painter.translate(std::sin(phase) * 8.0,
+                                       -std::max(0.0, std::cos(phase)) * 4.0);
+        const double legX = leg == 0 ? 87.0 : 127.0;
+        painter.setPen(QPen(outline, 2.4));
+        painter.setBrush(shellGradient(204, 230));
+        painter.drawRoundedRect(QRectF(legX, 206, 26, 23), 9, 9);
+        painter.setPen(QPen(QColor("#82a9b1"), 2, Qt::SolidLine, Qt::RoundCap));
+        painter.drawLine(QPointF(legX + 6, 224), QPointF(legX + 20, 224));
+        painter.restore();
+    }
+    drawArm(painter, false, pose, time, running, runPhase);
+    drawArm(painter, true, pose, time, running, runPhase);
 
     painter.setPen(QPen(outline, 2.5));
     painter.setBrush(shellGradient(145, 215));
@@ -280,7 +316,18 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.drawRoundedRect(QRectF(60, 79, 120, 60), 19, 19);
     painter.setPen(QPen(QColor(255, 255, 255, 30), 2, Qt::SolidLine, Qt::RoundCap));
     painter.drawLine(QPointF(77, 86), QPointF(108, 86));
-    drawEyes(painter, pose, time);
+    drawEyes(painter, pose, time, gazePosition, following);
+    if (following) {
+        // 固定的蓝色四角标记，让正看向中心时也能辨认跟随状态。
+        painter.setPen(QPen(QColor("#76d5ff"), 1.8, Qt::SolidLine, Qt::RoundCap));
+        for (double edgeX : {66.0, 174.0}) {
+            for (double edgeY : {85.0, 133.0}) {
+                const QPointF corner(edgeX, edgeY);
+                painter.drawLine(corner, corner + QPointF(edgeX < 120 ? 6 : -6, 0));
+                painter.drawLine(corner, corner + QPointF(0, edgeY < 110 ? 6 : -6));
+            }
+        }
+    }
 
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor(255, 152, 164, pose == PetPose::Happy ? 150 : 85));

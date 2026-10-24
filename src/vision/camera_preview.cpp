@@ -6,6 +6,7 @@
 #include "hand_presence.hpp"
 #include "hand_pose.hpp"
 #include "hand_gesture.hpp"
+#include "hand_position.hpp"
 #include <opencv2/core.hpp>
 #include "hand_gesture_state.hpp"
 #include<opencv2/imgproc.hpp>
@@ -102,7 +103,7 @@ int neko::vision::runCameraPreview(int cameraIndex){
             }
         }
 
-//--------下面是判断手势和手挥动判断-------
+//--------下面是判断手势以及其衍射的各种手势动作-------
 
         //当前帧判断手势的结果
         bool hasOpenPalm = false;
@@ -130,6 +131,7 @@ int neko::vision::runCameraPreview(int cameraIndex){
                 // 解码，还原到当前frame的坐标
                 HandPoseResult hand = decodeHandPose(handRaw, handInput);
 
+
                 // 结果有效时，绘制21个关键点
                 if (hand.valid) {
 
@@ -145,6 +147,17 @@ int neko::vision::runCameraPreview(int cameraIndex){
 
                 // 根据这只手的21个关键点判断手势
                 HandGesture gesture = classifyHandGesture(hand);
+
+                // 接收这只手的姿态、手势和当前画面尺寸，计算食指根部位置
+                HandPositionResult pointing =
+                    calculatePointingPosition(hand, gesture, frame.size());
+
+                // 临时打印，用来验证位置换算
+                if (pointing.valid) {
+                    cout << "Pointing position: "
+                        << pointing.position.x << ", "
+                        << pointing.position.y << '\n';
+                }
 
                 // 第一版在画面中只有一只手掌时记录
                 //记录解码结果和最终手势

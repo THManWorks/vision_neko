@@ -3,10 +3,12 @@
 #include "hand_presence.hpp"
 #include "hand_pose.hpp"
 #include "hand_gesture_state.hpp"
+#include "hand_position.hpp"
 #include "hand_wave.hpp"
 #include "palm_detector.hpp"
 
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QThread>
 
@@ -16,9 +18,20 @@
 #include <stdexcept>
 #include <utility>
 #include <chrono>
+#include <cmath>
 
 namespace neko::desktop {
 namespace {
+
+const char* gestureName(vision::HandGesture gesture)
+{
+    switch (gesture) {
+    case vision::HandGesture::OpenPalm: return "OpenPalm";
+    case vision::HandGesture::Fist: return "Fist";
+    case vision::HandGesture::Pointing: return "Pointing";
+    default: return "Unknown";
+    }
+}
 
 class CameraFailure final : public std::runtime_error {
 public:
@@ -62,6 +75,7 @@ public:
         cv::Mat frame;
         if (!camera_.read(frame) || frame.empty()) return false;
         cv::flip(frame, frame, 1);
+        result.frameSize = frame.size();
 
         // Reuse the student's three-stage pipeline without changing it.
         const auto input = vision::preprocessPalmFrame(frame);
@@ -72,6 +86,7 @@ public:
 
         bool hasOpenPalm = false;
         bool hasFist = false;
+        bool hasPointing = false;
         for (const auto& palm : detections) {
             if (QThread::currentThread()->isInterruptionRequested()) return true;
             const auto handInput = vision::preprocessHandPose(frame, palm);
@@ -82,11 +97,16 @@ public:
             if (result.handCount == 1) result.singleHand = hand;
             hasOpenPalm |= gesture == vision::HandGesture::OpenPalm;
             hasFist |= gesture == vision::HandGesture::Fist;
+            hasPointing |= gesture == vision::HandGesture::Pointing;
         }
 
-        // 与视觉预览一致：张手和握拳冲突，或均未识别时，采用 Unknown。
-        if (hasOpenPalm && !hasFist) result.gesture = vision::HandGesture::OpenPalm;
-        else if (hasFist && !hasOpenPalm) result.gesture = vision::HandGesture::Fist;
+        // 与视觉预览一致：只接受整帧唯一的已识别类别。
+        if (hasOpenPalm && !hasFist && !hasPointing)
+            result.gesture = vision::HandGesture::OpenPalm;
+        else if (hasFist && !hasOpenPalm && !hasPointing)
+            result.gesture = vision::HandGesture::Fist;
+        else if (hasPointing && !hasOpenPalm && !hasFist)
+            result.gesture = vision::HandGesture::Pointing;
         result.timeSeconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - clockStart_).count();
         return true;
@@ -109,14 +129,16 @@ class CameraWorker final : public QThread {
     Q_OBJECT
 
 public:
-    explicit CameraWorker(CameraSessionFactory factory, QObject* parent)
-        : QThread(parent), factory_(std::move(factory)) {}
+    explicit CameraWorker(CameraSessionFactory factory, QObject* parent, bool diagnosticsEnabled)
+        : QThread(parent), factory_(std::move(factory)), diagnosticsEnabled_(diagnosticsEnabled) {}
 
 signals:
     void ready();
     void presenceChanged(bool present);
     // 接收参数：视觉模块确认后，准备发送给桌面的静态或动态手势事件。
     void gestureConfirmed(neko::desktop::VisualEvent event);
+    void gazeChanged(bool active, const QPointF& position);
+    void frameDiagnostics(const QString& record);
     void failed(const QString& message);
 
 protected:
@@ -133,8 +155,15 @@ protected:
             vision::HandPresenceState state;
             vision::HandGestureState gestureState;
             vision::HandWaveState waveState;
+            bool gazeActive = false;
+            double lastPointingSeconds = 0.0;
+            QElapsedTimer diagnosticClock;
+            diagnosticClock.start();
+            QString previousDiagnosticState;
             while (!isInterruptionRequested()) {
                 CameraFrameResult frame;
+                QElapsedTimer processingClock;
+                if (diagnosticsEnabled_) processingClock.start();
                 if (!session->readFrame(frame)) {
                     if (!isInterruptionRequested()) {
                         throw CameraFailure(QStringLiteral("摄像头读取中断，请关闭后重新开启"));
@@ -163,6 +192,31 @@ protected:
                     waveState.turnCount = 0;
                 }
                 const bool singleHand = frame.hasHand && frame.handCount == 1;
+                const auto position = vision::calculatePointingPosition(
+                    frame.singleHand,
+                    singleHand ? frame.gesture : vision::HandGesture::Unknown,
+                    frame.frameSize);
+                if (position.valid) {
+                    // 与预览直接使用位置函数的结果一致，不再额外要求三帧。
+                    gazeActive = true;
+                    lastPointingSeconds = frame.timeSeconds;
+                    emit gazeChanged(true, QPointF(position.position.x, position.position.y));
+                } else {
+                    const auto& root = frame.singleHand.landmarks[5];
+                    const bool corruptPosition = frame.singleHand.valid &&
+                        (!std::isfinite(root.x) || !std::isfinite(root.y));
+                    const bool anotherGesture = singleHand && frame.singleHand.valid &&
+                        (frame.gesture == vision::HandGesture::OpenPalm ||
+                         frame.gesture == vision::HandGesture::Fist);
+                    const bool stopImmediately = frame.handCount > 1 || anotherGesture ||
+                        frame.frameSize.width <= 0 || frame.frameSize.height <= 0 || corruptPosition;
+                    // 短暂丢失只保留最后的真实位置，不更新或预测坐标。
+                    if (gazeActive && (stopImmediately ||
+                        frame.timeSeconds - lastPointingSeconds > 0.5)) {
+                        gazeActive = false;
+                        emit gazeChanged(false, QPointF(0.5, 0.5));
+                    }
+                }
                 const auto waveEvent = vision::updateHandWave(
                     waveState,
                     singleHand ? frame.singleHand : vision::HandPoseResult{},
@@ -170,6 +224,32 @@ protected:
                     frame.timeSeconds);
                 if (waveEvent == vision::HandWaveEvent::Waved) {
                     emit gestureConfirmed(VisualEvent::HandWave);
+                }
+                if (diagnosticsEnabled_) {
+                    const QString key = QStringLiteral("%1/%2/%3/%4/%5")
+                        .arg(frame.handCount).arg(frame.singleHand.valid)
+                        .arg(QString::fromLatin1(gestureName(frame.gesture)))
+                        .arg(gazeActive).arg(waveState.turnCount);
+                    if (key != previousDiagnosticState || diagnosticClock.elapsed() >= 250 ||
+                        waveEvent == vision::HandWaveEvent::Waved) {
+                        emit frameDiagnostics(QStringLiteral(
+                            "frame t=%1 read_infer_ms=%2 size=%3x%4 hands=%5 pose_valid=%6 "
+                            "confidence=%7 raw=%8 pointing_valid=%9 gaze_active=%10 "
+                            "root=(%11,%12) turns=%13 waved=%14 wrist_x=%15 "
+                            "wave_threshold=%16 wave_direction=%17")
+                            .arg(frame.timeSeconds, 0, 'f', 3).arg(processingClock.elapsed())
+                            .arg(frame.frameSize.width).arg(frame.frameSize.height)
+                            .arg(frame.handCount).arg(frame.singleHand.valid)
+                            .arg(frame.singleHand.confidence, 0, 'f', 3)
+                            .arg(QString::fromLatin1(gestureName(frame.gesture)))
+                            .arg(position.valid).arg(gazeActive).arg(frame.singleHand.landmarks[5].x)
+                            .arg(frame.singleHand.landmarks[5].y).arg(waveState.turnCount)
+                            .arg(waveEvent == vision::HandWaveEvent::Waved)
+                            .arg(frame.singleHand.landmarks[0].x).arg(waveState.moveThreshold)
+                            .arg(static_cast<int>(waveState.direction)));
+                        previousDiagnosticState = key;
+                        diagnosticClock.restart();
+                    }
                 }
             }
         } catch (const CameraFailure& error) {
@@ -184,6 +264,7 @@ protected:
 
 private:
     CameraSessionFactory factory_;
+    bool diagnosticsEnabled_ = false;
 };
 
 CameraController::CameraController(CameraOptions options, QObject* parent)
@@ -213,11 +294,12 @@ void CameraController::setEnabled(bool enabled)
 void CameraController::start()
 {
     if (worker_) return;
-    auto* worker = new CameraWorker(factory_, this);
+    auto* worker = new CameraWorker(factory_, this, diagnosticsEnabled_);
     worker_ = worker;
     active_ = true;
     stopping_ = false;
     failed_ = false;
+    emit gazeChanged(false, QPointF(0.5, 0.5));
 
     connect(worker, &CameraWorker::ready, this, [this, worker] {
         if (worker_ == worker && active_ && !stopping_) {
@@ -234,10 +316,20 @@ void CameraController::start()
             emit visualEvent(event);
         }
     }, Qt::QueuedConnection);
+    connect(worker, &CameraWorker::gazeChanged, this,
+            [this, worker](bool active, const QPointF& position) {
+        if (worker_ == worker && active_ && !stopping_) {
+            emit gazeChanged(active, position);
+        }
+    }, Qt::QueuedConnection);
+    connect(worker, &CameraWorker::frameDiagnostics, this, [this, worker](const QString& record) {
+        if (worker_ == worker && active_ && !stopping_) emit frameDiagnostics(record);
+    }, Qt::QueuedConnection);
     connect(worker, &CameraWorker::failed, this, [this, worker](const QString& message) {
         if (worker_ != worker || !active_ || stopping_) return;
         failed_ = true;
         active_ = false;
+        emit gazeChanged(false, QPointF(0.5, 0.5));
         emit statusChanged(message);
         emit controlsChanged(false, false);
     }, Qt::QueuedConnection);
@@ -246,6 +338,7 @@ void CameraController::start()
         worker_ = nullptr;
         active_ = false;
         stopping_ = false;
+        emit gazeChanged(false, QPointF(0.5, 0.5));
         if (!failed_) emit statusChanged(QStringLiteral("未开启"));
         emit controlsChanged(false, true);
         worker->deleteLater();
@@ -262,6 +355,7 @@ void CameraController::stop()
     if (!worker_ || stopping_) return;
     active_ = false;
     stopping_ = true;
+    emit gazeChanged(false, QPointF(0.5, 0.5));
     worker_->requestInterruption();
     emit controlsChanged(false, false);
     emit statusChanged(QStringLiteral("正在关闭"));
@@ -270,6 +364,7 @@ void CameraController::stop()
 void CameraController::shutdown()
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    emit gazeChanged(false, QPointF(0.5, 0.5));
     if (!worker_) return;
     disconnect(worker_, nullptr, this, nullptr);
     worker_->requestInterruption();

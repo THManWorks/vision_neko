@@ -3,10 +3,13 @@
 
 #include <QApplication>
 #include <QCommandLineParser>
+#include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QPixmap>
 #include <QTimer>
+#include <QTextStream>
 
 namespace {
 
@@ -23,6 +26,31 @@ QString defaultModelPath(const QString& relative)
         if (QFileInfo(candidate).isFile()) return QDir::cleanPath(candidate);
     }
     return QDir::cleanPath(candidates.front());
+}
+
+QString poseLabel(neko::desktop::PetPose pose)
+{
+    using neko::desktop::PetPose;
+    switch (pose) {
+    case PetPose::Happy: return QStringLiteral("Happy");
+    case PetPose::Wave: return QStringLiteral("Wave");
+    case PetPose::Sleep: return QStringLiteral("Sleep");
+    case PetPose::Surprise: return QStringLiteral("Surprise");
+    default: return QStringLiteral("Idle");
+    }
+}
+
+QString visualEventLabel(neko::desktop::VisualEvent event)
+{
+    using neko::desktop::VisualEvent;
+    switch (event) {
+    case VisualEvent::HandDetected: return QStringLiteral("HandDetected");
+    case VisualEvent::HandLost: return QStringLiteral("HandLost");
+    case VisualEvent::HandWave: return QStringLiteral("HandWave");
+    case VisualEvent::OpenPalmConfirmed: return QStringLiteral("OpenPalmConfirmed");
+    case VisualEvent::FistConfirmed: return QStringLiteral("FistConfirmed");
+    }
+    return QStringLiteral("Unknown");
 }
 
 } // namespace
@@ -42,6 +70,7 @@ int main(int argc, char** argv)
     parser.addOption({"snapshot", "Save a robot window image.", "path"});
     parser.addOption({"pose", "Initial pose: idle, happy, wave, sleep, surprise.", "name", "idle"});
     parser.addOption({"camera", "Start hand interaction immediately (camera access)."});
+    parser.addOption({"vision-debug", "Write numeric recognition and UI events to desktop-vision.log."});
     parser.addOption({"camera-index", "Camera device index.", "index", "0"});
     parser.addOption({"model", "Palm detection ONNX model path.", "path"});
     parser.addOption({"hand-pose-model", "Hand pose ONNX model path.", "path"});
@@ -60,6 +89,21 @@ int main(int argc, char** argv)
     bool validIndex = false;
     const int cameraIndex = parser.value("camera-index").toInt(&validIndex);
     if (!validIndex || cameraIndex < 0) parser.showHelp(2);
+
+    // 可选诊断只记录数字和事件，不保存图像；所有文件写入都在GUI线程。
+    QFile diagnostics(QDir(QCoreApplication::applicationDirPath()).filePath("desktop-vision.log"));
+    const bool tracing = parser.isSet("vision-debug") &&
+        diagnostics.open(QIODevice::WriteOnly | QIODevice::Text);
+    const auto writeTrace = [&diagnostics, tracing](const QString& record) {
+        if (!tracing) return;
+        QTextStream output(&diagnostics);
+        output << QDateTime::currentDateTime().toString(Qt::ISODateWithMs)
+               << ' ' << record << '\n';
+        output.flush();
+    };
+    writeTrace(QStringLiteral("start executable=%1 pid=%2 build=%3 %4")
+        .arg(QCoreApplication::applicationFilePath()).arg(QCoreApplication::applicationPid())
+        .arg(QString::fromLatin1(__DATE__)).arg(QString::fromLatin1(__TIME__)));
 
     PetWindow pet;
 
@@ -82,11 +126,35 @@ int main(int argc, char** argv)
 
     // 将配置交给摄像头控制器
     CameraController camera(options);
+    camera.setDiagnosticsEnabled(tracing);
+    writeTrace(QStringLiteral("models palm=%1 hand=%2 camera=%3")
+        .arg(options.modelPath).arg(options.handPoseModelPath).arg(options.cameraIndex));
 
     QObject::connect(&pet, &PetWindow::cameraRequested,
                      &camera, &CameraController::setEnabled);
-    QObject::connect(&camera, &CameraController::visualEvent,
-                     &pet, &PetWindow::reactTo);
+    QObject::connect(&camera, &CameraController::visualEvent, &pet,
+                     [&pet, writeTrace](VisualEvent event) {
+        pet.reactTo(event);
+        writeTrace(QStringLiteral("ui event=%1 pose=%2 gaze_active=%3")
+            .arg(visualEventLabel(event)).arg(poseLabel(pet.pose())).arg(pet.gazeActive()));
+    });
+    QObject::connect(&camera, &CameraController::gazeChanged,
+                     &pet, &PetWindow::setGazeTarget);
+    if (tracing) {
+        QObject::connect(&camera, &CameraController::frameDiagnostics, &pet, writeTrace);
+        QObject::connect(&pet, &PetWindow::gazeModeChanged, &pet,
+                         [&pet, writeTrace](bool active) {
+            writeTrace(QStringLiteral("ui gaze_active=%1 pose=%2")
+                .arg(active).arg(poseLabel(pet.pose())));
+        });
+        QObject::connect(&pet, &PetWindow::poseChanged, &pet, [&pet, writeTrace] {
+            writeTrace(QStringLiteral("ui pose_changed=%1").arg(poseLabel(pet.pose())));
+        });
+        QObject::connect(&camera, &CameraController::statusChanged, &pet,
+                         [writeTrace](const QString& status) {
+            writeTrace(QStringLiteral("status=%1").arg(status));
+        });
+    }
     QObject::connect(&camera, &CameraController::statusChanged,
                      &pet, &PetWindow::setCameraStatus);
     QObject::connect(&camera, &CameraController::controlsChanged,

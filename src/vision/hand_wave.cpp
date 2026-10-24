@@ -67,11 +67,13 @@ HandWaveEvent updateHandWave(
     // 0号关键点是手腕，取它在当前画面中的横坐标
     float x = hand.landmarks[0].x;
 
-    // 第一次记录，或本轮已经超时：从当前位置重新开始
+    // 还没有初始化 或 已经开始移动，并且计时满了1.5秒（超时)：：从当前位置重新开始
     // 每轮开始时，根据当前掌长确定移动阈值
     if (!state.initialized ||
-        nowSeconds - state.windowStarted >= 1.5) {
-        
+        (state.direction != HandMoveDirection::None &&
+        nowSeconds - state.windowStarted >= 1.5)) {
+
+
         //计算掌长
         float palmLength = calculatePalmLength(hand);
 
@@ -84,7 +86,7 @@ HandWaveEvent updateHandWave(
         }
 
         state.referenceX = x;
-        state.windowStarted = nowSeconds;
+
 
         // 移动0.2个掌长，才算一次有效移动
         //不用定值，避免与镜头的距离太近或者太远带来的问题
@@ -113,6 +115,12 @@ HandWaveEvent updateHandWave(
             state.direction = HandMoveDirection::Left;
             state.referenceX = x;
         }
+        // 首次确认有效移动方向，才开始1.5秒的挥手窗口
+        if (state.direction != HandMoveDirection::None) {
+            state.windowStarted = nowSeconds;
+            std::cout << "Wave start\n";
+        }
+
     }else if (state.direction == HandMoveDirection::Right) {
     if (x > state.referenceX) {
         // 继续向右，更新最右位置
