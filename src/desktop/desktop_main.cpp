@@ -1,5 +1,6 @@
 #include "pet_window.hpp"
 #include "camera_controller.hpp"
+#include "detection_preview.hpp"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -70,6 +71,7 @@ int main(int argc, char** argv)
     parser.addOption({"snapshot", "Save a robot window image.", "path"});
     parser.addOption({"pose", "Initial pose: idle, happy, wave, sleep, surprise.", "name", "idle"});
     parser.addOption({"camera", "Start hand interaction immediately (camera access)."});
+    parser.addOption({"preview", "Show the detection preview; use --camera to start camera access."});
     parser.addOption({"vision-debug", "Write numeric recognition and UI events to desktop-vision.log."});
     parser.addOption({"camera-index", "Camera device index.", "index", "0"});
     parser.addOption({"model", "Palm detection ONNX model path.", "path"});
@@ -106,6 +108,7 @@ int main(int argc, char** argv)
         .arg(QString::fromLatin1(__DATE__)).arg(QString::fromLatin1(__TIME__)));
 
     PetWindow pet;
+    DetectionPreviewWindow preview;
 
     // 准备摄像头模块需要的配置
     CameraOptions options;
@@ -132,6 +135,22 @@ int main(int argc, char** argv)
 
     QObject::connect(&pet, &PetWindow::cameraRequested,
                      &camera, &CameraController::setEnabled);
+    const auto applyPreview = [&camera, &pet, &preview](bool enabled) {
+        camera.setPreviewEnabled(enabled);
+        pet.setPreviewChecked(camera.previewEnabled());
+        if (camera.previewEnabled()) {
+            preview.show();
+            preview.raise();
+        } else {
+            preview.setFrame(QImage());
+            preview.hide();
+        }
+    };
+    QObject::connect(&pet, &PetWindow::previewRequested, &preview, applyPreview);
+    QObject::connect(&preview, &DetectionPreviewWindow::closed, &pet,
+                     [applyPreview] { applyPreview(false); });
+    QObject::connect(&camera, &CameraController::previewFrameReady,
+                     &preview, &DetectionPreviewWindow::setFrame);
     QObject::connect(&camera, &CameraController::visualEvent, &pet,
                      [&pet, writeTrace](VisualEvent event) {
         pet.reactTo(event);
@@ -139,7 +158,13 @@ int main(int argc, char** argv)
             .arg(visualEventLabel(event)).arg(poseLabel(pet.pose())).arg(pet.gazeActive()));
     });
     QObject::connect(&camera, &CameraController::gazeChanged,
-                     &pet, &PetWindow::setGazeTarget);
+                     &pet, [&pet, writeTrace](bool active, const QPointF& position,
+                                              bool predicted) {
+        pet.setGazeTarget(active, position, predicted);
+        writeTrace(QStringLiteral("ui gaze_target active=%1 predicted=%2 x=%3 y=%4")
+            .arg(active).arg(predicted).arg(position.x(), 0, 'f', 3)
+            .arg(position.y(), 0, 'f', 3));
+    });
     if (tracing) {
         QObject::connect(&camera, &CameraController::frameDiagnostics, &pet, writeTrace);
         QObject::connect(&pet, &PetWindow::gazeModeChanged, &pet,
@@ -157,12 +182,15 @@ int main(int argc, char** argv)
     }
     QObject::connect(&camera, &CameraController::statusChanged,
                      &pet, &PetWindow::setCameraStatus);
+    QObject::connect(&camera, &CameraController::statusChanged,
+                     &preview, &DetectionPreviewWindow::setCameraStatus);
     QObject::connect(&camera, &CameraController::controlsChanged,
                      &pet, &PetWindow::setCameraControls);
     QObject::connect(&app, &QCoreApplication::aboutToQuit,
                      &camera, &CameraController::shutdown);
     pet.showPose(pose);
     pet.show();
+    applyPreview(parser.isSet("preview"));
     if (parser.isSet("camera")) camera.setEnabled(true);
     if (parser.isSet("snapshot")) {
         const QString path = parser.value("snapshot");

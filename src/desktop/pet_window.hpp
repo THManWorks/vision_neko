@@ -37,13 +37,15 @@ public:
     void constrainToScreen();
     void setCameraStatus(const QString& status);
     void setCameraControls(bool checked, bool enabled);
-    // 接收参数：是否跟随、0～1的画面位置；有效时机器人追随，失效时停步。
-    void setGazeTarget(bool active, const QPointF& position);
+    void setPreviewChecked(bool checked);
+    // 预测位置可以继续追随，但只有真实测量才能开启或延长跟随。
+    void setGazeTarget(bool active, const QPointF& position, bool predicted = false);
     bool gazeActive() const { return gazeActive_; }
     QPointF gazePosition() const { return gazePosition_; }
 
 signals:
     void cameraRequested(bool enabled);
+    void previewRequested(bool enabled);
     void gazeModeChanged(bool active);
     void poseChanged();
 
@@ -68,6 +70,7 @@ private:
     QSystemTrayIcon* tray_ = nullptr;
     QAction* hideAction_ = nullptr;
     QAction* cameraAction_ = nullptr;
+    QAction* previewAction_ = nullptr;
     QAction* cameraStatusAction_ = nullptr;
     QLabel* gazeStatusLabel_ = nullptr;
     QElapsedTimer clock_;
@@ -77,7 +80,8 @@ private:
     bool gazeActive_ = false;
     QPointF gazeTarget_{0.5, 0.5};
     QPointF gazePosition_{0.5, 0.5};
-    qint64 gazeUpdated_ = 0;
+    qint64 gazeTargetUpdated_ = 0;
+    qint64 gazeMeasured_ = 0;
     qint64 lastTick_ = 0;
     QPointer<QScreen> followScreen_;
     QPointF followPosition_;

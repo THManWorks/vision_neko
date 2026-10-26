@@ -1,6 +1,8 @@
 #include "camera_controller.hpp"
 #include "pet_window.hpp"
 #include "hand_pose.hpp"
+#include "hand_interaction.hpp"
+#include "hand_preview.hpp"
 
 #include <QAction>
 #include <QCoreApplication>
@@ -48,8 +50,9 @@ struct ScriptFrame {
     int handCount = 0;
     neko::vision::HandGesture gesture = neko::vision::HandGesture::Unknown;
     float palmLength = 250.0f; // At 0.2 palm length, existing scripts still need 50 pixels.
-    cv::Point3f indexBase{};
+    cv::Point3f indexTip{};
     cv::Size frameSize{640, 480};
+    cv::Mat rawFrame;
 };
 
 ScriptFrame scaledPalm(double time, float wristX, float palmLength)
@@ -60,8 +63,57 @@ ScriptFrame scaledPalm(double time, float wristX, float palmLength)
 ScriptFrame pointingAt(float x, float y, double timeSeconds = 0.0)
 {
     ScriptFrame frame(timeSeconds, 100.0f, true, 1, neko::vision::HandGesture::Pointing);
-    frame.indexBase = cv::Point3f(x, y, 0.0f);
+    frame.indexTip = cv::Point3f(x, y, 0.0f);
     return frame;
+}
+
+ScriptFrame withRawFrame(ScriptFrame frame, const cv::Scalar& bgr = cv::Scalar(11, 37, 211))
+{
+    frame.rawFrame = cv::Mat(frame.frameSize, CV_8UC3, bgr);
+    return frame;
+}
+
+CameraFrameResult observedFrame(const ScriptFrame& input)
+{
+    using neko::vision::HandGesture;
+    CameraFrameResult result;
+    result.frameSize = input.frameSize;
+    result.timeSeconds = input.timeSeconds;
+    const int handCount = input.observation ? input.handCount
+        : input.frame == Frame::Missing ? 0 : input.frame == Frame::Conflict ? 2 : 1;
+    const bool valid = input.observation ? input.poseValid
+        : input.frame == Frame::OpenPalm || input.frame == Frame::Fist
+            || input.frame == Frame::Conflict;
+    const HandGesture gesture = input.observation ? input.gesture
+        : input.frame == Frame::OpenPalm ? HandGesture::OpenPalm
+        : input.frame == Frame::Fist ? HandGesture::Fist : HandGesture::Unknown;
+    for (int index = 0; index < handCount; ++index) {
+        neko::vision::HandFrameResult hand;
+        hand.palm.score = 1.0f;
+        hand.pose.valid = valid;
+        hand.gesture = valid ? gesture : HandGesture::Unknown;
+        if (input.frame == Frame::Conflict)
+            hand.gesture = index == 0 ? HandGesture::OpenPalm : HandGesture::Fist;
+        // Translate wrist and middle-finger base together so horizontal motion
+        // does not change the requested palm scale.
+        hand.pose.landmarks[0] = cv::Point3f(input.wristX, 200.0f, 0.0f);
+        hand.pose.landmarks[9] = cv::Point3f(
+            input.wristX, 200.0f - input.palmLength, 0.0f);
+        // Deliberately differ from the tip so using landmark 5 fails the test.
+        hand.pose.landmarks[5] = cv::Point3f(32.0f, 48.0f, 0.0f);
+        hand.pose.landmarks[8] = input.indexTip;
+        hand.pointing = neko::vision::calculatePointingPosition(
+            hand.pose, hand.gesture, result.frameSize);
+        result.hands.push_back(hand);
+    }
+    if (handCount > 0 && input.frame != Frame::Conflict)
+        result.frameGesture = result.hands.front().gesture;
+    return result;
+}
+
+QPointF trackingPosition(const neko::vision::HandInteractionResult& result)
+{
+    return QPointF(result.tracking.position.x, result.tracking.position.y);
 }
 
 // Reads wait for explicit test input and always notice interruption. No test
@@ -76,10 +128,12 @@ struct Script {
     std::atomic<int> requestedReads{0};
     std::atomic<int> startedReads{0};
     std::atomic<int> completedReads{0};
+    std::atomic<int> previewReads{0};
     std::atomic<int> destroyed{0};
     std::atomic<quintptr> createdOn{0};
     std::atomic<quintptr> openedOn{0};
     std::atomic<quintptr> destroyedOn{0};
+    std::atomic<quintptr> previewOn{0};
 
     void append(std::initializer_list<ScriptFrame> values)
     {
@@ -93,6 +147,16 @@ struct Script {
         std::lock_guard<std::mutex> lock(mutex);
         holdRead = value;
         changed.notify_all();
+    }
+
+    bool waitForRequestedReads(int count)
+    {
+        // Unlike QTRY macros, this barrier deliberately does not dispatch GUI
+        // events. It lets tests leave a preview queued before stopping/toggling.
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(5), [&] {
+            return requestedReads.load() >= count;
+        });
     }
 };
 
@@ -126,6 +190,7 @@ public:
         // Requesting the next frame means the worker finished processing the
         // previous one. Tests use this barrier before asserting no wave arrived.
         ++script_->requestedReads;
+        script_->changed.notify_all();
         std::unique_lock<std::mutex> lock(script_->mutex);
         const auto interrupted = [] {
             return QThread::currentThread()->isInterruptionRequested();
@@ -143,30 +208,23 @@ public:
         ++script_->completedReads;
         if (frame == Frame::Throw) throw std::runtime_error("Scripted inference failure");
         if (frame == Frame::ReadFailure) return false;
-        result = CameraFrameResult{};
-        result.hasHand = frame != Frame::Missing;
-        result.handCount = result.hasHand ? 1 : 0;
-        result.frameSize = input.frameSize;
-        if (frame == Frame::OpenPalm) result.gesture = neko::vision::HandGesture::OpenPalm;
-        else if (frame == Frame::Fist) result.gesture = neko::vision::HandGesture::Fist;
-        if (input.observation) {
-            result.hasHand = input.handCount > 0;
-            result.handCount = input.handCount;
-            result.gesture = input.gesture;
-            result.singleHand.valid = input.handCount == 1 && input.poseValid;
-            // Translate the wrist and middle-finger base together, keeping
-            // the requested palm scale independent of horizontal movement.
-            result.singleHand.landmarks[0] = cv::Point3f(input.wristX, 200.0f, 0.0f);
-            result.singleHand.landmarks[9] = cv::Point3f(
-                input.wristX, 200.0f - input.palmLength, 0.0f);
-            result.singleHand.landmarks[5] = input.indexBase;
-            result.timeSeconds = input.timeSeconds;
-        }
+        result = observedFrame(input);
+        // Reuse session-owned pixels, just as VideoCapture does on the next
+        // camera read. A preview must own its copy beyond this buffer's life.
+        input.rawFrame.copyTo(previewFrame_);
         return true;
+    }
+
+    cv::Mat frameForPreview() const override
+    {
+        script_->previewOn = currentThreadId();
+        ++script_->previewReads;
+        return previewFrame_;
     }
 
 private:
     std::shared_ptr<Script> script_;
+    cv::Mat previewFrame_;
 };
 
 CameraSessionFactory scriptedFactory(
@@ -188,13 +246,271 @@ int handWaveCount(const QSignalSpy& events)
     return count;
 }
 
+int nonNullPreviewCount(const QSignalSpy& previews)
+{
+    int count = 0;
+    for (const auto& arguments : previews) {
+        if (!qvariant_cast<QImage>(arguments.at(0)).isNull()) ++count;
+    }
+    return count;
+}
+
+QImage renderedPreview(const ScriptFrame& frame,
+                       const neko::vision::HandInteractionResult& interaction)
+{
+    const cv::Mat bgr = neko::vision::drawHandPreview(
+        frame.rawFrame, observedFrame(frame), interaction);
+    return QImage(bgr.data, bgr.cols, bgr.rows,
+                  static_cast<qsizetype>(bgr.step), QImage::Format_RGB888).rgbSwapped();
+}
+
 } // namespace
 
 class CameraTests : public QObject {
     Q_OBJECT
 
 private slots:
-    void firstValidPointingFrameImmediatelyStreamsRootPositionsOnTheGuiThread()
+    void previewToggleWithoutCameraOnlyClearsTheDisplay()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        QVERIFY(!controller.previewEnabled());
+
+        controller.setPreviewEnabled(true);
+        QVERIFY(controller.previewEnabled());
+        QCOMPARE(previews.count(), 1);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        controller.setPreviewEnabled(false);
+        QVERIFY(!controller.previewEnabled());
+        QCOMPARE(previews.count(), 2);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        QVERIFY(!controller.active());
+        QVERIFY(!controller.busy());
+        QCOMPARE(calls->load(), 0);
+        QCOMPARE(script->opened.load(), 0);
+        QCOMPARE(script->previewReads.load(), 0);
+    }
+
+    void disabledPreviewSkipsRawFramesWhileInteractionContinues()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        QSignalSpy events(&controller, &CameraController::visualEvent);
+        QSignalSpy gaze(&controller, &CameraController::gazeChanged);
+        controller.setEnabled(true);
+        const auto palm = withRawFrame(Frame::OpenPalm);
+        script->append({palm, palm, palm});
+        QTRY_COMPARE(events.count(), 2);
+        QCOMPARE(qvariant_cast<VisualEvent>(events.last().at(0)), VisualEvent::OpenPalmConfirmed);
+        QCOMPARE(script->previewReads.load(), 0);
+        QCOMPARE(nonNullPreviewCount(previews), 0);
+
+        controller.setPreviewEnabled(true);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        script->append({withRawFrame(pointingAt(480, 120, 0.1))});
+        QTRY_COMPARE(nonNullPreviewCount(previews), 1);
+        QTRY_VERIFY(gaze.last().at(0).toBool());
+        QCOMPARE(script->previewReads.load(), 1);
+        controller.setPreviewEnabled(false);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        QVERIFY(controller.active());
+        const auto fist = withRawFrame(Frame::Fist);
+        script->append({fist, fist, fist});
+        QTRY_COMPARE(events.count(), 3);
+        QCOMPARE(qvariant_cast<VisualEvent>(events.last().at(0)), VisualEvent::FistConfirmed);
+        QVERIFY(!gaze.last().at(0).toBool());
+        QCOMPARE(script->previewReads.load(), 1);
+        QCOMPARE(calls->load(), 1);
+        QCOMPARE(script->opened.load(), 1);
+        controller.shutdown();
+    }
+
+    void previewUsesTheSharedResultAndOwnsAnnotatedRgbPixels()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        QSignalSpy gaze(&controller, &CameraController::gazeChanged);
+        bool deliveredOnGuiThread = true;
+        connect(&controller, &CameraController::previewFrameReady, &controller,
+                [&](const QImage&) {
+            deliveredOnGuiThread &= QThread::currentThread() == controller.thread();
+        });
+        controller.setEnabled(true);
+        gaze.clear();
+        const auto first = pointingAt(160, 120);
+        const auto second = withRawFrame(pointingAt(480, 360, 0.1));
+        neko::vision::HandInteractionState reference;
+        neko::vision::updateHandInteraction(reference, observedFrame(first));
+        const auto expectedInteraction = neko::vision::updateHandInteraction(
+            reference, observedFrame(second));
+        const QImage expected = renderedPreview(second, expectedInteraction);
+        // Enabling the display mid-session must preserve the filter history.
+        script->append({first});
+        QVERIFY(script->waitForRequestedReads(2));
+        controller.setPreviewEnabled(true);
+        script->append({second});
+        QVERIFY(script->waitForRequestedReads(3));
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(nonNullPreviewCount(previews), 1);
+        QCOMPARE(gaze.count(), 2);
+        QCOMPARE(gaze.last().at(1).toPointF(), trackingPosition(expectedInteraction));
+        QVERIFY(gaze.last().at(1).toPointF() != QPointF(0.75, 0.75));
+        const QImage delivered = qvariant_cast<QImage>(previews.last().at(0));
+        QCOMPARE(delivered.format(), QImage::Format_RGB888);
+        QCOMPARE(delivered.size(), QSize(640, 480));
+        QCOMPARE(delivered.pixelColor(639, 479), QColor(211, 37, 11));
+        QCOMPARE(delivered, expected);
+        const QImage unannotated(second.rawFrame.data, second.rawFrame.cols,
+            second.rawFrame.rows, static_cast<qsizetype>(second.rawFrame.step),
+            QImage::Format_RGB888);
+        QVERIFY(delivered != unannotated.rgbSwapped());
+        QCOMPARE(script->previewReads.load(), 1);
+        QCOMPARE(script->completedReads.load(), 2);
+        QCOMPARE(script->requestedReads.load(), 3); // Only the normal next read is waiting.
+        QCOMPARE(calls->load(), 1);
+        QCOMPARE(script->opened.load(), 1);
+        QCOMPARE(script->previewOn.load(), script->createdOn.load());
+        QVERIFY(script->previewOn.load() != currentThreadId());
+        QVERIFY(deliveredOnGuiThread);
+
+        controller.setPreviewEnabled(false);
+        script->append({withRawFrame(pointingAt(320, 240, 0.2), cv::Scalar(255, 0, 0))});
+        QVERIFY(script->waitForRequestedReads(4));
+        QCOMPARE(delivered, expected); // The session has overwritten its reusable Mat.
+        controller.shutdown();
+        QCOMPARE(script->destroyed.load(), 1);
+        QCOMPARE(delivered, expected); // Its backing pixels also outlive the session.
+    }
+
+    void slowGuiQueuesOnlyOnePreviewWithoutDroppingInteractionFrames()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        QSignalSpy gaze(&controller, &CameraController::gazeChanged);
+        controller.setPreviewEnabled(true);
+        controller.setEnabled(true);
+        previews.clear();
+        gaze.clear();
+        const auto frame = withRawFrame(pointingAt(160, 120));
+        script->append({frame, frame, frame, frame, frame, frame, frame, frame});
+        QVERIFY(script->waitForRequestedReads(9));
+        QCOMPARE(script->completedReads.load(), 8);
+        QCOMPARE(script->previewReads.load(), 1);
+        QCOMPARE(previews.count(), 0); // The GUI has not dispatched the queued frame yet.
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(nonNullPreviewCount(previews), 1);
+        QCOMPARE(gaze.count(), 8);
+        QCOMPARE(calls->load(), 1);
+        controller.shutdown();
+    }
+
+    void previewOffOnSuppressesAnAlreadyQueuedGeneration()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        controller.setPreviewEnabled(true);
+        controller.setEnabled(true);
+        previews.clear();
+        script->append({withRawFrame(pointingAt(160, 120))});
+        QVERIFY(script->waitForRequestedReads(2));
+        QCOMPARE(script->previewReads.load(), 1);
+        QCOMPARE(previews.count(), 0);
+
+        controller.setPreviewEnabled(false);
+        controller.setPreviewEnabled(true);
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(previews.count(), 2);
+        QCOMPARE(nonNullPreviewCount(previews), 0);
+        QVERIFY(controller.active());
+        QCOMPARE(calls->load(), 1);
+        // The discarded image must also release the pending slot, so the new
+        // generation can resume after the normal display throttle interval.
+        QTest::qWait(100);
+        script->append({withRawFrame(pointingAt(480, 360, 0.1))});
+        QTRY_COMPARE(nonNullPreviewCount(previews), 1);
+        QCOMPARE(script->previewReads.load(), 2);
+        controller.shutdown();
+    }
+
+    void stopAndImmediateRestartSuppressTheOldWorkersQueuedPreview()
+    {
+        auto first = std::make_shared<Script>();
+        auto second = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({first, second}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        controller.setPreviewEnabled(true);
+        controller.setEnabled(true);
+        previews.clear();
+        first->append({withRawFrame(pointingAt(160, 120), cv::Scalar(0, 0, 255))});
+        QVERIFY(first->waitForRequestedReads(2));
+        QCOMPARE(first->previewReads.load(), 1);
+        controller.setEnabled(false);
+        QVERIFY(!controller.active());
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        controller.shutdown();
+        QCOMPARE(first->destroyed.load(), 1);
+        // Restart before dispatching any callback posted by the previous worker.
+        controller.setEnabled(true);
+        const auto fresh = withRawFrame(pointingAt(480, 360), cv::Scalar(255, 0, 0));
+        second->append({fresh});
+        QVERIFY(second->waitForRequestedReads(2));
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(nonNullPreviewCount(previews), 1);
+        neko::vision::HandInteractionState reference;
+        const auto interaction = neko::vision::updateHandInteraction(reference, observedFrame(fresh));
+        QCOMPARE(qvariant_cast<QImage>(previews.last().at(0)), renderedPreview(fresh, interaction));
+        QCOMPARE(calls->load(), 2);
+        QVERIFY(controller.active());
+        controller.shutdown();
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+    }
+
+    void failuresClearThePreview_data()
+    {
+        QTest::addColumn<int>("failure");
+        QTest::newRow("open") << 0;
+        QTest::newRow("read") << 1;
+        QTest::newRow("inference") << 2;
+    }
+
+    void failuresClearThePreview()
+    {
+        QFETCH(int, failure);
+        auto script = std::make_shared<Script>();
+        script->failOpen = failure == 0;
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy previews(&controller, &CameraController::previewFrameReady);
+        controller.setPreviewEnabled(true);
+        controller.setEnabled(true);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        if (failure != 0) {
+            script->append({withRawFrame(pointingAt(160, 120))});
+            QTRY_COMPARE(nonNullPreviewCount(previews), 1);
+            previews.clear();
+            script->append({failure == 1 ? Frame::ReadFailure : Frame::Throw});
+        }
+        QTRY_VERIFY(!controller.busy());
+        QVERIFY(!controller.active());
+        QVERIFY(controller.previewEnabled());
+        QVERIFY(!previews.empty());
+        QCOMPARE(nonNullPreviewCount(previews), 0);
+        QVERIFY(qvariant_cast<QImage>(previews.last().at(0)).isNull());
+        QCOMPARE(script->destroyed.load(), 1);
+    }
+
+    void firstValidPointingFrameImmediatelyStreamsTipAndFilteredPositionsOnTheGuiThread()
     {
         auto script = std::make_shared<Script>();
         auto calls = std::make_shared<std::atomic<int>>(0);
@@ -204,51 +520,71 @@ private slots:
         PetWindow pet;
         bool deliveredOnGuiThread = true;
         connect(&controller, &CameraController::gazeChanged, &pet,
-                [&](bool active, const QPointF& position) {
+                [&](bool active, const QPointF& position, bool predicted) {
             deliveredOnGuiThread &= QThread::currentThread() == pet.thread();
-            pet.setGazeTarget(active, position);
+            pet.setGazeTarget(active, position, predicted);
         });
         QSignalSpy gaze(&controller, &CameraController::gazeChanged);
         controller.setEnabled(true);
         QTRY_COMPARE(script->opened.load(), 1);
         gaze.clear();
 
-        // Match the user's position function: one valid frame is sufficient.
-        script->append({pointingAt(480, 120)});
+        neko::vision::HandInteractionState reference;
+        const auto first = pointingAt(480, 120);
+        const auto firstExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(first));
+        // The user's position function uses the tip and accepts the first frame.
+        script->append({first});
         QTRY_COMPARE(gaze.count(), 1);
         QVERIFY(gaze.at(0).at(0).toBool());
         QCOMPARE(gaze.at(0).at(1).toPointF(), QPointF(0.75, 0.25));
+        QCOMPARE(gaze.at(0).at(1).toPointF(), trackingPosition(firstExpected));
+        QVERIFY(!gaze.at(0).at(2).toBool());
         QVERIFY(pet.gazeActive());
         QTRY_VERIFY(!diagnostics.empty());
         const QString record = diagnostics.last().at(0).toString();
         QVERIFY(record.contains("raw=Pointing"));
         QVERIFY(record.contains("size=640x480"));
         QVERIFY(record.contains("pointing_valid=1"));
-        QVERIFY(record.contains("root=(480,120)"));
+        QVERIFY(record.contains("measurement=(0.75,0.25)"));
+        QVERIFY(record.contains("tracking_valid=1"));
+        QVERIFY(record.contains("predicted=0"));
         QVERIFY(!record.contains('%')); // All numeric log placeholders must be substituted.
 
-        script->append({pointingAt(160, 360, 0.1)});
+        const auto second = pointingAt(160, 360, 0.1);
+        const auto secondExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(second));
+        script->append({second});
         QTRY_COMPARE(gaze.count(), 2);
-        QCOMPARE(gaze.at(1).at(1).toPointF(), QPointF(0.25, 0.75));
-        script->append({pointingAt(-20, 520, 0.2)});
+        const QPointF filtered = gaze.at(1).at(1).toPointF();
+        QCOMPARE(filtered, trackingPosition(secondExpected));
+        QVERIFY(filtered.x() > 0.25 && filtered.x() < 0.75);
+        QVERIFY(filtered.y() > 0.25 && filtered.y() < 0.75);
+        QVERIFY(!gaze.at(1).at(2).toBool());
+        const auto third = pointingAt(-20, 520, 0.2);
+        const auto thirdExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(third));
+        script->append({third});
         QTRY_COMPARE(gaze.count(), 3);
-        QCOMPARE(gaze.at(2).at(1).toPointF(), QPointF(0.0, 1.0));
+        QCOMPARE(gaze.at(2).at(1).toPointF(), trackingPosition(thirdExpected));
+        QVERIFY(gaze.at(2).at(1).toPointF().x() >= 0.0);
+        QVERIFY(gaze.at(2).at(1).toPointF().y() <= 1.0);
+        QVERIFY(!gaze.at(2).at(2).toBool());
         QVERIFY(deliveredOnGuiThread);
         controller.shutdown();
         QVERIFY(!pet.gazeActive());
     }
 
-    void explicitExitOrCorruptPointingInputImmediatelyClearsGaze_data()
+    void explicitGestureOrMultipleHandsImmediatelyClearsGaze_data()
     {
         QTest::addColumn<int>("reason");
         QTest::newRow("open-palm") << 0;
         QTest::newRow("fist") << 1;
         QTest::newRow("multiple-hands") << 2;
-        QTest::newRow("non-finite-root") << 3;
-        QTest::newRow("missing-frame-size") << 4;
+        QTest::newRow("multiple-invalid-poses") << 3;
     }
 
-    void explicitExitOrCorruptPointingInputImmediatelyClearsGaze()
+    void explicitGestureOrMultipleHandsImmediatelyClearsGaze()
     {
         QFETCH(int, reason);
         auto script = std::make_shared<Script>();
@@ -265,12 +601,14 @@ private slots:
         auto invalid = pointingAt(480, 120, 0.1);
         if (reason == 0) invalid.gesture = neko::vision::HandGesture::OpenPalm;
         else if (reason == 1) invalid.gesture = neko::vision::HandGesture::Fist;
-        else if (reason == 2) invalid.handCount = 2;
-        else if (reason == 3) invalid.indexBase.x = std::numeric_limits<float>::quiet_NaN();
-        else invalid.frameSize = cv::Size();
+        else {
+            invalid.handCount = 2;
+            if (reason == 3) invalid.poseValid = false;
+        }
         script->append({invalid});
         QTRY_COMPARE(gaze.count(), 1);
         QVERIFY(!gaze.last().at(0).toBool());
+        QVERIFY(!gaze.last().at(2).toBool());
         QVERIFY(!pet.gazeActive());
 
         // A new valid observation is accepted without a second confirmation gate.
@@ -278,19 +616,22 @@ private slots:
         QTRY_COMPARE(gaze.count(), 2);
         QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
+        QVERIFY(!gaze.last().at(2).toBool());
         QVERIFY(pet.gazeActive());
         controller.shutdown();
     }
 
-    void briefUncertainInputHoldsOnlyTheLastRealPosition_data()
+    void uncertainInputsStreamSharedPredictionsUntilHalfASecond_data()
     {
         QTest::addColumn<int>("reason");
         QTest::newRow("unknown") << 0;
         QTest::newRow("invalid-pose") << 1;
         QTest::newRow("no-hand") << 2;
+        QTest::newRow("non-finite-tip") << 3;
+        QTest::newRow("missing-frame-size") << 4;
     }
 
-    void briefUncertainInputHoldsOnlyTheLastRealPosition()
+    void uncertainInputsStreamSharedPredictionsUntilHalfASecond()
     {
         QFETCH(int, reason);
         auto script = std::make_shared<Script>();
@@ -300,30 +641,49 @@ private slots:
         controller.setEnabled(true);
         QTRY_COMPARE(script->opened.load(), 1);
         gaze.clear();
-        script->append({pointingAt(480, 120)});
-        QTRY_COMPARE(gaze.count(), 1);
-        QVERIFY(gaze.last().at(0).toBool());
-
-        auto gap = pointingAt(9000, 9000, 0.2);
-        if (reason == 0) gap.gesture = neko::vision::HandGesture::Unknown;
-        else if (reason == 1) gap.poseValid = false;
-        else gap.handCount = 0;
-        auto boundary = gap;
-        boundary.timeSeconds = 0.5;
-        script->append({gap, boundary});
-        QTRY_VERIFY(script->requestedReads.load() >= 4);
-        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
-        QCOMPARE(gaze.count(), 1); // No false event, no fabricated position refresh.
-        QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.75, 0.25));
-
-        script->append({pointingAt(160, 360, 0.51)});
+        neko::vision::HandInteractionState reference;
+        const auto first = pointingAt(160, 120);
+        const auto second = pointingAt(320, 240, 0.125);
+        neko::vision::updateHandInteraction(reference, observedFrame(first));
+        const auto secondExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(second));
+        script->append({first, second});
         QTRY_COMPARE(gaze.count(), 2);
         QVERIFY(gaze.last().at(0).toBool());
+        QVERIFY(!gaze.last().at(2).toBool());
+
+        auto gap = pointingAt(9000, 9000, 0.25);
+        if (reason == 0) gap.gesture = neko::vision::HandGesture::Unknown;
+        else if (reason == 1) gap.poseValid = false;
+        else if (reason == 2) gap.handCount = 0;
+        else if (reason == 3) gap.indexTip.x = std::numeric_limits<float>::quiet_NaN();
+        else gap.frameSize = cv::Size();
+        auto boundary = gap;
+        boundary.timeSeconds = 0.625; // Exactly 0.5 seconds since the last real sample.
+        const auto gapExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(gap));
+        const auto boundaryExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(boundary));
+        script->append({gap, boundary});
+        QTRY_COMPARE(gaze.count(), 4);
+        QVERIFY(gaze.at(2).at(0).toBool());
+        QVERIFY(gaze.at(2).at(2).toBool());
+        QCOMPARE(gaze.at(2).at(1).toPointF(), trackingPosition(gapExpected));
+        QVERIFY(gaze.at(3).at(0).toBool());
+        QVERIFY(gaze.at(3).at(2).toBool());
+        QCOMPARE(gaze.at(3).at(1).toPointF(), trackingPosition(boundaryExpected));
+        QVERIFY(gaze.at(2).at(1).toPointF().x() > trackingPosition(secondExpected).x());
+
+        // A real sample after the prediction window initializes a fresh tracker.
+        script->append({pointingAt(160, 360, 0.7)});
+        QTRY_COMPARE(gaze.count(), 5);
+        QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
+        QVERIFY(!gaze.last().at(2).toBool());
         controller.shutdown();
     }
 
-    void uncertainInputLongerThanHalfASecondClearsGazeWithoutInventingCoordinates()
+    void uncertainInputLongerThanHalfASecondClearsGazeOnceAndResetsTracking()
     {
         auto script = std::make_shared<Script>();
         auto calls = std::make_shared<std::atomic<int>>(0);
@@ -337,19 +697,102 @@ private slots:
         auto gap = pointingAt(9000, 9000, 0.49);
         gap.poseValid = false;
         script->append({gap});
-        QTRY_VERIFY(script->requestedReads.load() >= 3);
-        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
-        QCOMPARE(gaze.count(), 1);
+        QTRY_COMPARE(gaze.count(), 2);
+        QVERIFY(gaze.last().at(0).toBool());
+        QVERIFY(gaze.last().at(2).toBool());
         gap.timeSeconds = 0.51;
         script->append({gap});
-        QTRY_COMPARE(gaze.count(), 2);
+        QTRY_COMPARE(gaze.count(), 3);
         QVERIFY(!gaze.last().at(0).toBool());
+        QVERIFY(!gaze.last().at(2).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.5, 0.5));
 
-        script->append({pointingAt(160, 360, 0.6)});
-        QTRY_COMPARE(gaze.count(), 3);
+        gap.timeSeconds = 0.6;
+        script->append({gap});
+        QTRY_VERIFY(script->requestedReads.load() >= 5);
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(gaze.count(), 3); // Continued invalid frames do not repeat the clear.
+        script->append({pointingAt(160, 360, 0.7)});
+        QTRY_COMPARE(gaze.count(), 4);
         QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
+        QVERIFY(!gaze.last().at(2).toBool());
+        controller.shutdown();
+    }
+
+    void desktopAdapterMatchesTheSharedInteractionStream()
+    {
+        using namespace neko::vision;
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy events(&controller, &CameraController::visualEvent);
+        QSignalSpy gaze(&controller, &CameraController::gazeChanged);
+        controller.setEnabled(true);
+        QTRY_COMPARE(script->opened.load(), 1);
+        gaze.clear();
+
+        auto unknown = pointingAt(9000, 9000, 0.25);
+        unknown.gesture = HandGesture::Unknown;
+        auto corrupt = pointingAt(9000, 9000, 0.375);
+        corrupt.indexTip.x = std::numeric_limits<float>::quiet_NaN();
+        const std::vector<ScriptFrame> stream{
+            pointingAt(160, 120), pointingAt(320, 240, 0.125), unknown, corrupt,
+            ScriptFrame(0.625, 0, false, 0), ScriptFrame(0.75, 0, false, 0),
+            ScriptFrame(0.875, 0, false, 2),
+            ScriptFrame(1.0, 100), ScriptFrame(1.125, 150),
+            ScriptFrame(1.25, 100), ScriptFrame(1.375, 150),
+            ScriptFrame(1.5, 100, true, 1, HandGesture::Fist),
+            ScriptFrame(1.625, 100, true, 1, HandGesture::Fist),
+            ScriptFrame(1.75, 100, true, 1, HandGesture::Fist),
+            ScriptFrame(1.875, 0, false, 0), ScriptFrame(2.0, 0, false, 0),
+            ScriptFrame(2.125, 0, false, 0), ScriptFrame(2.25, 0, false, 0),
+            ScriptFrame(2.375, 0, false, 0),
+            ScriptFrame(2.5, 0, false), ScriptFrame(2.625, 0, false),
+            ScriptFrame(2.75, 0, false), pointingAt(480, 360, 2.875)
+        };
+        struct ExpectedGaze {
+            bool active;
+            QPointF position;
+            bool predicted;
+        };
+        HandInteractionState reference;
+        std::vector<VisualEvent> expectedEvents;
+        std::vector<ExpectedGaze> expectedGaze;
+        bool referenceActive = false;
+        for (const auto& input : stream) {
+            const auto interaction = updateHandInteraction(reference, observedFrame(input));
+            if (interaction.presenceEvent == HandPresenceEvent::Appeared)
+                expectedEvents.push_back(VisualEvent::HandDetected);
+            else if (interaction.presenceEvent == HandPresenceEvent::Disappeared)
+                expectedEvents.push_back(VisualEvent::HandLost);
+            if (interaction.gestureEvent == HandGestureEvent::OpenPalmConfirmed)
+                expectedEvents.push_back(VisualEvent::OpenPalmConfirmed);
+            else if (interaction.gestureEvent == HandGestureEvent::FistConfirmed)
+                expectedEvents.push_back(VisualEvent::FistConfirmed);
+            if (interaction.waveEvent == HandWaveEvent::Waved)
+                expectedEvents.push_back(VisualEvent::HandWave);
+            if (interaction.tracking.valid) {
+                expectedGaze.push_back({true, trackingPosition(interaction),
+                                        interaction.tracking.predicted});
+            } else if (referenceActive) {
+                expectedGaze.push_back({false, QPointF(0.5, 0.5), false});
+            }
+            referenceActive = interaction.tracking.valid;
+            script->append({input});
+        }
+        QTRY_COMPARE(script->requestedReads.load(), static_cast<int>(stream.size()) + 1);
+        QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
+        QCOMPARE(events.count(), static_cast<int>(expectedEvents.size()));
+        for (int index = 0; index < events.count(); ++index)
+            QCOMPARE(qvariant_cast<VisualEvent>(events.at(index).at(0)), expectedEvents.at(index));
+        QCOMPARE(gaze.count(), static_cast<int>(expectedGaze.size()));
+        for (int index = 0; index < gaze.count(); ++index) {
+            QCOMPARE(gaze.at(index).at(0).toBool(), expectedGaze.at(index).active);
+            QCOMPARE(gaze.at(index).at(1).toPointF(), expectedGaze.at(index).position);
+            QCOMPARE(gaze.at(index).at(2).toBool(), expectedGaze.at(index).predicted);
+        }
+        QVERIFY(handWaveCount(events) > 0);
         controller.shutdown();
     }
 
@@ -382,6 +825,7 @@ private slots:
         QTRY_COMPARE(gaze.count(), 1);
         QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
+        QVERIFY(!gaze.last().at(2).toBool());
         QVERIFY(pet.gazeActive());
         second->append({Frame::ReadFailure});
         QTRY_VERIFY(!controller.busy());

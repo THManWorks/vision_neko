@@ -2,7 +2,11 @@
 
 `neko_desktop.exe` 已接入手掌检测、21 点手部姿态、张手/握拳/Pointing分类、跨帧确认、动态挥手和食指目光跟随。默认启动时摄像头关闭，通过机器人或托盘的右键菜单手动开启。原来的 `neko.exe` 继续用于摄像头画面、绿框和视觉代码调试。
 
-Pointing（仅伸食指）的分类和5号食指根部位置换算已由用户初步验证。桌面端复用用户的 `calculatePointingPosition()`，首帧有效单手Pointing即可带领整只机器人在屏幕内追随食指根部，同时保留目光跟随。已删除桌面额外的“三帧有效且任一无效立刻清零”门槛；该门槛与预览直接采用有效位置的行为不同。真实体验仍需复测，模拟测试通过不代表真实识别率。
+需要同时观察机器人和识别画面时，在右键菜单勾选“开启手势互动”和“显示检测画面”。检测窗口显示同一摄像头帧的手掌框、7个参考点、21个姿态点和位置跟踪标记，复用 `drawHandPreview()`；绿色跟踪标记表示真实测量参与校正，橙色表示短时预测。画面最多约每80ms刷新一次，视觉识别仍按摄像头循环执行，不增加摄像头读取或模型推理。窗口可以调整大小并保持图像比例，空余区域为深色。
+
+只勾选“显示检测画面”会显示等待窗口，不会开启摄像头。关闭检测窗口仅停止显示，不影响手势互动或机器人；摄像头关闭或出错时会清除旧画面并显示当前状态。图像只在本机内存中显示。请不要同时启动独立的 `neko.exe` 来占用摄像头。
+
+桌面端与预览共用用户的 `analyzeVisionFrame()` 和 `updateHandInteraction()`。当前 `calculatePointingPosition()` 使用8号食指指尖，识别阶段每只手只计算一次位置；跨帧交互统一完成卡尔曼校正与短时预测。首帧有效单手Pointing即可带领整只机器人在屏幕内追随指尖，同时保留目光跟随。此次统一接入、指尖跟踪与短时预测的真实摄像头体验仍待复测，模拟测试不代表真实识别率。
 
 ## 编译与运行
 
@@ -20,9 +24,10 @@ cmake -S . -B build && cmake --build build --target neko_desktop && run-desktop.
 - 每次开启手势互动后，首次连续检测到手掌3帧：机器人开心欢迎一次。同一轮互动中手离开再出现不重复欢迎；关闭再开启后重新允许一次。
 - 连续识别为张手3帧：保留分类事件，不再触发开心，避免和动态挥手交替。
 - 连续识别为握拳 3 帧：保留握拳事件，暂不播放动作。
-- 有效单手Pointing：首帧进入“食指带路中”，整只机器人追向食指根部在屏幕中的对应位置；左右方向与镜像预览一致。奔跑时显示“追着食指跑！”，伴随迈腿、摆臂、轻微前倾和蓝色速度线；眼睛仍随目标移动。到达后停步等待继续指路，退出后提示与蓝色标记消失。
+- 有效单手Pointing：首帧进入“食指带路中”，整只机器人追向食指指尖在屏幕中的对应位置，后续采用视觉模块校正后的跟踪目标；左右方向与镜像预览一致。奔跑时显示“追着食指跑！”，伴随迈腿、摆臂、轻微前倾和蓝色速度线；眼睛仍随目标移动。到达后停步等待继续指路，退出后提示与蓝色标记消失。
 - 追随在当前屏幕的可用区域内进行，机器人全身留在边界内；最高约700逻辑像素/秒，接近目标减速，10像素内停步。鼠标拖动、操作菜单、隐藏或播放挥手动画时暂停追逐；手动拖到另一屏幕后改用释放位置所在屏幕。
-- Unknown、姿态无效或短暂无手时：最多保留最后一次真实位置0.5秒，不预测坐标；超过180ms没有新位置时先停止奔跑、显示“等你继续指路”，恢复首帧即可继续。明确变为张手/握拳、出现多手、坐标损坏或画面尺寸无效时立即退出。超过0.5秒没有新位置，目光回中、机器人留在当前位置。关闭、异常和重启均停止追逐，旧会话结果不能重新激活。
+- Unknown、姿态无效或短暂无手时：共享跟踪器可在最近一次真实测量后不超过0.5秒内输出预测目标，预测有效时机器人可继续追随。坐标损坏或画面尺寸无效造成的位置测量无效，也遵循同一短时丢失规则；单手有效姿态明确变为张手/握拳，或出现多手时立即结束位置跟踪。视觉时间超过0.5秒没有真实测量后，跟踪结果失效。
+- 桌面分别记录最新跟踪目标和最近真实测量的到达时间：超过180ms没有新目标时先停步，显示“等你继续指路”；距最近一次真实测量到达已满500ms时退出跟随、目光回中，机器人留在当前位置。预测能刷新目标，却不能开启或重新激活跟随，也不能延长真实测量的500ms期限。恢复真实输入的首帧即可重新跟随。关闭、读取失败、处理异常和重启均停止追逐，旧会话结果不能重新激活。
 - 单手张开，手腕在1.5秒内完成两次有效转向：机器人挥手回应。每轮开始时，取手腕（0号点）到中指根部（9号点）的二维像素距离，以其0.2倍作为移动阈值；整轮固定，重新开始时再计算。掌长80～110像素时对应16～22像素；触发后冷却1秒。
 - 动态挥手允许有效输入之间短暂中断，不超过0.5秒时保留已有运动记录；无效坐标不参与计数，超过时限或出现多只手掌则重新开始。
 - 连续未检测到手掌5帧：机器人惊讶一下。正在挥手时先播放完整动作；正在跟随时等待短时容错到期。期间恢复真实输入则取消待播放的惊讶，避免动作刚触发就被覆盖。
@@ -32,14 +37,14 @@ cmake -S . -B build && cmake --build build --target neko_desktop && run-desktop.
 
 当前手势动作映射为“本轮互动首次 `HandDetected → Happy`”、`HandWave → Wave`、`HandLost → Surprise`；`OpenPalmConfirmed` 和 `FistConfirmed` 不播放动作。开心的手势触发次数按开启会话记录，不采用倒计时冷却；挥手识别仍冷却1秒，挥手/开心/惊讶动画约2.2秒，动画时长和识别冷却是两回事。静态手势状态清除仅用于重新确认，不会覆盖手离开时的惊讶动作。鼠标点击、右键菜单中的手动动作保留。图片在本机进行推理，此版本没有保存或上传画面。
 
-食指带路复用独立的位置通道，不需要每帧重新触发静态动作。开始跟随时会结束遮眼的开心/睡眠姿态，挥手动画仍播放完。位置映射是桌面表现，不增加网络推理，也未加入卡尔曼滤波；卡尔曼位置跟踪留待下一步实现。
+食指带路复用独立的位置通道，不需要每帧重新触发静态动作。开始跟随时会结束遮眼的开心/睡眠姿态，挥手动画仍播放完。卡尔曼位置跟踪由用户的 `hand_position_tracker.*` 实现，桌面直接使用统一交互结果中的校正或预测坐标；屏幕位置映射和角色动作由桌面负责，不增加模型推理。
 
 请先退出原来的摄像头预览程序，再开启桌面程序的手势互动，避免同时占用同一个摄像头。两个模型文件应位于：
 
 - `models/palm_detection_mediapipe_2023feb.onnx`
 - `models/handpose_estimation_mediapipe_2023feb.onnx`
 
-默认根据可执行文件的位置查找模型，支持从其他工作目录启动。开启互动时加载一次两个模型，后续每帧复用；处理每只检测到的手掌后，汇总整帧静态手势，并用单手姿态和会话内时间更新一次挥手状态。无手帧也会更新状态，重启时重新计时和计数。
+默认根据可执行文件的位置查找模型，支持从其他工作目录启动。开启互动时加载一次两个模型，后续每帧复用。采集和镜像后立即取得会话内单调时间，再调用一次 `analyzeVisionFrame()`；该时间的取得位置与预览一致。每只手的姿态、手势和真实位置只计算一次，随后每帧调用一次 `updateHandInteraction()`，更新存在、静态手势、挥手和位置跟踪。每轮会话在循环外创建一份 `HandInteractionState`，无手帧也更新，关闭后释放，重启时重新计时和计数。
 
 若设备或模型出错，窗口提示和右键菜单会显示原因，摄像头选项恢复为未勾选；处理问题后可以再次开启。关闭时会等待正在执行的读取或推理结束，再释放资源；异常摄像头驱动的阻塞调用可能延迟关闭，不会强制终止线程。
 
@@ -48,6 +53,7 @@ cmake -S . -B build && cmake --build build --target neko_desktop && run-desktop.
 - 左键点击：开心一下。
 - 按住左键拖动：移动机器人，松开后限制在屏幕可用区域内。
 - 右键机器人或系统托盘图标：开启/关闭手势互动，或选择挥手、开心、睡觉、叫醒、隐藏、退出。
+- 勾选“显示检测画面”：打开独立检测窗口，与机器人同时显示；取消勾选或关闭该窗口不关闭摄像头。
 - 隐藏后：在托盘菜单选择“显示宠物”，或双击托盘图标。隐藏只暂停绘制，已经开启的摄像头仍然工作；需要停止时取消“开启手势互动”。
 - ESC：退出程序，需要机器人窗口获得键盘焦点。退出会关闭摄像头。
 - 如果系统没有托盘，隐藏菜单会禁用，防止无法找回窗口。
@@ -60,33 +66,38 @@ cmake -S . -B build && cmake --build build --target neko_desktop && run-desktop.
 
 ```text
 摄像头后台线程
-  采集 → preprocessPalmFrame → runPalmInference → decodePalms
-       ├→ updateHandPresence → Appeared / Disappeared
-       └→ 每只手：preprocessHandPose → runHandPoseInference → decodeHandPose
-                  → classifyHandGesture
-          汇总整帧 → updateHandGesture → OpenPalmConfirmed / FistConfirmed
-          单手姿态和时间 → updateHandWave → Waved → HandWave
-          有效单手Pointing → calculatePointingPosition → 持续真实位置
+  采集 → 镜像 → 取得会话内时间
+       → analyzeVisionFrame → VisionFrameResult
+          手掌检测 → 每只手的姿态、手势、指尖真实测量 → 整帧手势汇总
+       → updateHandInteraction（每帧一次，共用一份会话状态）
+          ├→ presenceEvent → HandDetected / HandLost
+          ├→ gestureEvent → OpenPalmConfirmed / FistConfirmed
+          ├→ waveEvent → HandWave
+          └→ tracking → 有效校正/预测目标，或失效
+       → 可选 drawHandPreview（复用上述帧结果）→ 独立的检测图像窗口
                                           ↓ 排队传递到主线程
 桌面主线程
   HandDetected（本轮首次）→ PetWindow::reactTo → Happy（欢迎）
   HandWave          → PetWindow::reactTo → Wave（挥手）
   HandLost          → PetWindow::reactTo → Surprise（惊讶）
   OpenPalmConfirmed / FistConfirmed / 本轮后续HandDetected → 不播放动作
-  持续位置 / 失效 → PetWindow::setGazeTarget → 机器人追随及目光 / 停步回中
+  跟踪目标 / 预测标记 / 失效 → PetWindow::setGazeTarget → 机器人追随及目光 / 停步回中
 ```
 
-- `src/vision/palm_detector.*`、`hand_presence.*`、`hand_pose.*`、`hand_gesture.*`、`hand_gesture_state.*`、`hand_wave.*`、`hand_position.*`：用户实现的视觉算法，组成共用的 `neko_vision_pipeline` 库。
-- `src/vision/camera_preview.*`：原有绿框预览程序。
-- `src/desktop/camera_controller.*`：桌面侧的摄像头后台任务、开关、状态显示和事件转发。
+- `src/vision/palm_detector.*`、`hand_presence.*`、`hand_pose.*`、`hand_gesture.*`、`hand_gesture_state.*`、`hand_wave.*`、`hand_position.*`、`hand_position_tracker.*`：用户实现的视觉算法及卡尔曼跟踪，组成共用的 `neko_vision_pipeline` 库。
+- `src/vision/hand.*`：每只手与整帧的统一结果，以及 `analyzeVisionFrame()` 识别入口。
+- `src/vision/hand_interaction.*`：统一跨帧状态与 `updateHandInteraction()` 交互入口。
+- `src/vision/camera_preview.*`、`hand_preview.*`：共用上述入口的摄像头预览及绘图。
+- `src/desktop/camera_controller.*`：桌面侧的摄像头后台任务、开关、状态显示和统一结果转发。
 - `src/desktop/visual_event.hpp`：桌面动作事件；`HandWave` 对应视觉模块确认的动态挥手。
 - `src/desktop/pet_window.*`：透明置顶窗口、鼠标互动、托盘和动作切换。
+- `src/desktop/detection_preview.*`：检测画面窗口，在主线程显示后台生成的独立图像。
 - `src/desktop/robot_renderer.*`：绘制角色和动画。
 - `src/desktop/desktop_main.cpp`：桌面入口和连接事件的位置。
 
 视觉代码不依赖 Qt。摄像头、模型、锚点及跨帧状态均在后台线程使用和释放；窗口只从 GUI 主线程操作。关闭后尚在排队的视觉结果会被忽略，上一轮任务完成前不能再次开启。
 
-当前分工：用户继续开发视觉算法，助手负责 Qt 界面、桌面接入和事件连接。`CameraFrameResult` 把手掌数量、静态手势、单手姿态、完整画面尺寸和会话内单调时间传给后台状态判断；已有的视觉函数保持原样供两个程序共用，挥手和跟随都不增加模型推理。位置通过 `gazeChanged(bool, QPointF)` 排队传回GUI线程；不在后台线程操作窗口。
+当前分工：用户继续开发视觉算法，助手负责 Qt 界面、桌面接入和事件连接。`CameraFrameResult` 是 `vision::VisionFrameResult` 的类型别名，直接传递完整画面尺寸、会话内单调时间、各只手的结果和整帧手势。桌面不另做视觉分类、位置计算或跨帧识别判定；两个程序共用视觉入口，挥手和跟随都不增加模型推理。位置通过 `gazeChanged(bool active, QPointF position, bool predicted)` 排队传回GUI线程；`predicted` 区分预测目标与包含真实测量的校正目标，窗口只在主线程更新。
 
 若只想构建视觉预览，运行 `cmake --build build --target neko`；在没有 Qt 的环境中，可配置 `-DNEKO_BUILD_DESKTOP=OFF`。
 
@@ -102,17 +113,22 @@ cmake --build build && ctest --test-dir build --output-on-failure
 
 距离适配检查额外覆盖同样移动幅度在不同掌长下的触发差异、同一轮内阈值锁定、超时/长丢失后采用新尺度，以及零或非有限初始尺度不触发且恢复后重新计数。模拟中的手腕和中指根部同步横移，避免把位置变化误当作掌长变化。
 
+位置接入检查区分首帧真实测量、后续校正目标和短时预测，覆盖预测标记传递、丢失期限、明确手势或多手退出，以及关闭和重启后的旧结果抑制。桌面交互检查覆盖预测刷新追随目标、预测不能开启或延长跟随，以及真实测量恢复。上述检查均不替代此次接入的真实摄像头复测。
+
+检测画面检查使用合成图像，验证开关不启动第二个摄像头、画面与识别结果对应、颜色与像素内存独立、关闭与重启时清除旧画面，以及窗口缩放和菜单同步。自动检查不访问真实摄像头。
+
 ## 识别与桌面表现对照
 
 在项目目录运行 `run-desktop.cmd --vision-debug`，再从右键菜单开启互动。程序将本次记录写入 `build/desktop-vision.log`，不保存摄像头图像；默认启动不写该文件。每次诊断启动覆盖上一份记录。
 
-记录包含实际运行程序/模型路径、每帧耗时、画面尺寸、手掌数量、姿态有效性与置信度、原始手势、食指位置是否有效、挥手阈值/方向/转向数，以及视觉事件送达后的UI姿态与跟随状态。`raw=Pointing`、`pointing_valid=1` 与 `ui gaze_active=1` 可对照位置是否被接入；`waved=1`、`ui event=HandWave` 与 `ui pose_changed=Wave` 可区分视觉未触发和桌面动画被覆盖。
+记录包含实际运行程序/模型路径、每帧耗时、画面尺寸、手掌数量、姿态有效性与置信度、整帧原始手势、指尖真实测量和跟踪结果、挥手阈值/方向/转向数，以及视觉事件送达后的UI姿态与跟随状态。`pointing_valid=1` 与归一化的 `measurement=(x,y)` 表示本帧真实测量有效；`tracking_valid=1`、`predicted=0` 与 `target=(x,y)` 表示包含测量的跟踪目标，`predicted=1` 则表示短时预测。测量无效时应结合有效标记读取坐标。`ui gaze_target` 记录送达桌面的目标与预测标记，`ui gaze_active` 记录窗口实际进入或退出跟随；两者可用于观察桌面的真实测量期限。`waved=1`、`ui event=HandWave` 与 `ui pose_changed=Wave` 可区分视觉未触发和桌面动画被覆盖。
 
-两个入口均使用镜像画面、同一模型函数和同一 `updateHandWave()`，不为桌面私自调整视觉识别阈值。出现差异时先根据这些记录定位，不把自动模拟检查当成摄像头实测。
+两个入口均使用镜像画面、同一 `analyzeVisionFrame()` 和 `updateHandInteraction()`，共用分类、挥手、真实位置计算与卡尔曼跟踪，不为桌面私自调整视觉识别阈值。出现差异时先根据这些记录定位，不把自动模拟检查当成摄像头实测。
 
 命令行选项：
 
 - `--camera`：启动后立即开启摄像头，默认不开启。
+- `--preview`：启动时显示检测窗口；单独使用时等待手动开启摄像头，`run-desktop.cmd --camera --preview` 可同时开启互动和检测显示。
 - `--vision-debug`：记录数值识别结果与实际UI事件到本地日志，不保存图像。
 - `--camera-index 1`：使用指定摄像头编号，默认 `0`。
 - `--model 路径.onnx`：指定手掌检测模型文件。
@@ -121,4 +137,4 @@ cmake --build build && ctest --test-dir build --output-on-failure
 - `--pose wave`：指定初始姿态。
 - `--snapshot 路径.png`：保存窗口绘图。
 
-例如 `run-desktop.cmd --camera-index 1` 可选择另一个设备，再从右键菜单开启。用户已体验动作映射与光效；新增距离适配的真实远近效果待对照，托盘、多显示器拖动和不同缩放比例也需结合真实桌面检查。目前依赖本机 MSYS2，尚未制作可复制到其他电脑直接运行的安装包。
+例如 `run-desktop.cmd --camera-index 1` 可选择另一个设备，再从右键菜单开启。用户已体验动作映射与光效；统一流水线接入后的指尖跟踪、短时预测和距离适配效果仍待真实摄像头对照，托盘、多显示器拖动和不同缩放比例也需结合真实桌面检查。目前依赖本机 MSYS2，尚未制作可复制到其他电脑直接运行的安装包。

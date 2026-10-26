@@ -1,14 +1,18 @@
 #include "pet_window.hpp"
+#include "detection_preview.hpp"
 
+#include <QAction>
 #include <QApplication>
 #include <QImage>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QScreen>
+#include <QSignalSpy>
 #include <QTest>
 #include <QTimer>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -18,6 +22,126 @@ class DesktopTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void previewMenuIsIndependentAndSynchronizesWithoutSignals()
+    {
+        PetWindow pet;
+        auto* previewAction = pet.findChild<QAction*>("previewAction");
+        auto* cameraAction = pet.findChild<QAction*>("cameraAction");
+        QVERIFY(previewAction);
+        QVERIFY(cameraAction);
+        QCOMPARE(previewAction->text(), QStringLiteral("显示检测画面"));
+        QVERIFY(previewAction->isCheckable());
+        QVERIFY(!previewAction->isChecked());
+        QSignalSpy previewRequests(&pet, &PetWindow::previewRequested);
+        QSignalSpy cameraRequests(&pet, &PetWindow::cameraRequested);
+
+        previewAction->trigger();
+        QCOMPARE(previewRequests.count(), 1);
+        QCOMPARE(previewRequests.at(0).at(0).toBool(), true);
+        QCOMPARE(cameraRequests.count(), 0);
+        QVERIFY(!cameraAction->isChecked());
+
+        pet.setPreviewChecked(false);
+        QVERIFY(!previewAction->isChecked());
+        QCOMPARE(previewRequests.count(), 1);
+        pet.setCameraControls(true, false);
+        QVERIFY(previewAction->isEnabled());
+        QVERIFY(!previewAction->isChecked());
+        pet.setPreviewChecked(true);
+        QVERIFY(previewAction->isChecked());
+        QCOMPARE(previewRequests.count(), 1);
+        pet.setCameraControls(false, true);
+        QVERIFY(previewAction->isChecked());
+        QCOMPARE(cameraRequests.count(), 0);
+    }
+
+    void previewOwnsTheImageAndFitsItWithoutStretching_data()
+    {
+        QTest::addColumn<QSize>("windowSize");
+        QTest::addColumn<QSize>("imageSize");
+        QTest::newRow("wide-image") << QSize(640, 480) << QSize(160, 80);
+        QTest::newRow("tall-image") << QSize(800, 400) << QSize(80, 160);
+    }
+
+    void previewOwnsTheImageAndFitsItWithoutStretching()
+    {
+        QFETCH(QSize, windowSize);
+        QFETCH(QSize, imageSize);
+        DetectionPreviewWindow preview;
+        preview.resize(windowSize);
+        QImage source(imageSize, QImage::Format_RGB32);
+        source.fill(Qt::red);
+        auto* sourcePixels = reinterpret_cast<QRgb*>(source.bits());
+        preview.setFrame(source);
+        // Bypass implicit-sharing detachment, just as a reused camera buffer does.
+        std::fill_n(sourcePixels, source.width() * source.height(), qRgb(0, 255, 0));
+        QImage rendered(windowSize, QImage::Format_RGB32);
+        preview.render(&rendered);
+
+        QRect imageBounds;
+        int redPixels = 0;
+        for (int y = 0; y < rendered.height(); ++y) {
+            for (int x = 0; x < rendered.width(); ++x) {
+                if (rendered.pixelColor(x, y) != QColor(Qt::red)) continue;
+                imageBounds |= QRect(x, y, 1, 1);
+                ++redPixels;
+            }
+        }
+        QVERIFY(redPixels > 1000);
+        QCOMPARE(redPixels, imageBounds.width() * imageBounds.height());
+        const double renderedAspect = static_cast<double>(imageBounds.width()) /
+                                      imageBounds.height();
+        const double sourceAspect = static_cast<double>(imageSize.width()) /
+                                    imageSize.height();
+        QVERIFY(std::abs(renderedAspect - sourceAspect) < 0.01);
+        QVERIFY(std::abs(imageBounds.center().x() - rendered.rect().center().x()) <= 1);
+        QVERIFY(imageBounds.top() > 35);
+        QVERIFY(imageBounds.bottom() < rendered.height() - 8);
+        QCOMPARE(rendered.pixelColor(0, rendered.height() - 1), QColor("#161c26"));
+
+        preview.setCameraStatus(QStringLiteral("已关闭"));
+        preview.setFrame(QImage());
+        QImage waiting(windowSize, QImage::Format_RGB32);
+        preview.render(&waiting);
+        QVERIFY(preview.windowTitle().contains(QStringLiteral("已关闭")));
+        QVERIFY(waiting != rendered);
+        int remainingRedPixels = 0;
+        for (int y = 0; y < waiting.height(); ++y)
+            for (int x = 0; x < waiting.width(); ++x)
+                remainingRedPixels += waiting.pixelColor(x, y) == QColor(Qt::red);
+        QCOMPARE(remainingRedPixels, 0);
+    }
+
+    void closingPreviewOnlyHidesItAndUnchecksTheMenu()
+    {
+        PetWindow pet;
+        DetectionPreviewWindow preview;
+        pet.setCameraControls(true, true);
+        pet.setPreviewChecked(true);
+        auto* previewAction = pet.findChild<QAction*>("previewAction");
+        auto* cameraAction = pet.findChild<QAction*>("cameraAction");
+        QVERIFY(previewAction);
+        QVERIFY(cameraAction);
+        QSignalSpy closed(&preview, &DetectionPreviewWindow::closed);
+        QSignalSpy lastWindowClosed(qApp, &QGuiApplication::lastWindowClosed);
+        QSignalSpy cameraRequests(&pet, &PetWindow::cameraRequested);
+        connect(&preview, &DetectionPreviewWindow::closed, &pet,
+                [&pet] { pet.setPreviewChecked(false); });
+        QVERIFY(!preview.testAttribute(Qt::WA_QuitOnClose));
+        preview.show();
+        QVERIFY(preview.isVisible());
+        QVERIFY(preview.close());
+        QCoreApplication::processEvents();
+        QCOMPARE(closed.count(), 1);
+        QVERIFY(!preview.isVisible());
+        QVERIFY(!previewAction->isChecked());
+        QVERIFY(cameraAction->isChecked());
+        QCOMPARE(cameraRequests.count(), 0);
+        QCOMPARE(lastWindowClosed.count(), 0);
+        preview.show();
+        QVERIFY(preview.isVisible());
+    }
+
     void fingerChaseMovesGraduallyAndStaysOnTheScreen()
     {
         PetWindow pet;
@@ -69,6 +193,95 @@ private slots:
         QCOMPARE(pet.pos(), stopped); // No new observation: do not keep chasing stale data.
         QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
         QCOMPARE(pet.pos(), stopped);
+    }
+
+    void predictedTargetsCannotStartOrReviveFollowing()
+    {
+        PetWindow pet;
+        pet.show();
+        pet.setGazeTarget(true, QPointF(0.9, 0.1), true);
+        QVERIFY(!pet.gazeActive());
+
+        pet.setGazeTarget(true, QPointF(0.9, 0.1));
+        QVERIFY(pet.gazeActive());
+        pet.setGazeTarget(false, QPointF(0.5, 0.5));
+        pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
+        QVERIFY(!pet.gazeActive());
+
+        // The setter must enforce expiry even when the animation timer cannot tick.
+        pet.setGazeTarget(true, QPointF(0.9, 0.1));
+        auto* timer = pet.findChild<QTimer*>("animationTimer");
+        QVERIFY(timer);
+        timer->stop();
+        QTest::qWait(520);
+        pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
+        QVERIFY(!pet.gazeActive());
+        pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
+        QVERIFY(!pet.gazeActive());
+
+        // Existing two-argument callers still supply a real measurement.
+        pet.setGazeTarget(true, QPointF(0.1, 0.9));
+        QVERIFY(pet.gazeActive());
+    }
+
+    void predictedTargetsCannotExtendTheRealMeasurementDeadline()
+    {
+        PetWindow pet;
+        pet.show();
+        pet.setGazeTarget(true, QPointF(0.9, 0.1));
+        pet.reactTo(VisualEvent::HandLost);
+        QTimer predictions;
+        predictions.setInterval(40);
+        connect(&predictions, &QTimer::timeout, &pet,
+                [&] { pet.setGazeTarget(true, QPointF(0.1, 0.9), true); });
+        predictions.start();
+        QTest::qWait(300);
+        QVERIFY(pet.gazeActive());
+        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
+        QTest::qWait(100);
+        QVERIFY(!pet.gazeActive());
+        QCOMPARE(pet.pose(), PetPose::Surprise);
+    }
+
+    void shortPredictionsRefreshTheTrackingTargetForEyesAndChase()
+    {
+        PetWindow pet;
+        pet.show();
+        const QRect area = QGuiApplication::primaryScreen()->availableGeometry();
+        if (area.width() < pet.width() + 200 || area.height() < pet.height() + 200)
+            QSKIP("The test needs room to move the robot");
+        pet.move(area.topLeft() + QPoint(20, 20));
+        pet.setGazeTarget(true, QPointF(0, 0));
+        QTest::qWait(230); // Real coordinates are now too old for the 180 ms motion guard.
+        const QPoint stopped = pet.pos();
+
+        QTimer predictions;
+        predictions.setInterval(40);
+        connect(&predictions, &QTimer::timeout, &pet,
+                [&] { pet.setGazeTarget(true, QPointF(1, 1), true); });
+        pet.setGazeTarget(true, QPointF(1, 1), true);
+        predictions.start();
+        QTest::qWait(120);
+        QVERIFY(pet.gazeActive());
+        QVERIFY(pet.gazePosition().x() > 0.6);
+        QVERIFY(pet.gazePosition().y() > 0.6);
+        QVERIFY(pet.pos() != stopped);
+        const QPoint resumed = pet.pos();
+        QTest::qWait(80);
+        QVERIFY(pet.pos() != resumed);
+    }
+
+    void twoArgumentTargetsRefreshTheRealMeasurementDeadline()
+    {
+        PetWindow pet;
+        pet.show();
+        pet.setGazeTarget(true, QPointF(0.1, 0.2));
+        QTest::qWait(300);
+        pet.setGazeTarget(true, QPointF(0.9, 0.8));
+        QTest::qWait(300);
+        QVERIFY(pet.gazeActive());
+        QVERIFY(pet.gazePosition().x() > 0.8);
+        QVERIFY(pet.gazePosition().y() > 0.7);
     }
 
     void fingerChasePausesForUserControlAndWave_data()

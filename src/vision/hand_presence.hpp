@@ -15,7 +15,7 @@ namespace neko::vision {
     };
 
 
-    // 状态
+    // 跨帧状态
     struct HandPresenceState {
         bool handPresent = false; // 稳定判断后的状态
         int detectedFrames = 0;   // 连续检测到手的帧数

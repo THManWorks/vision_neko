@@ -1,9 +1,10 @@
 #pragma once
 
 #include "visual_event.hpp"
-#include "hand_gesture.hpp"
+#include "hand.hpp"
 
 #include <QObject>
+#include <QImage>
 #include <QPointF>
 #include <QString>
 
@@ -18,15 +19,8 @@ struct CameraOptions {
     QString handPoseModelPath; // 手部姿态模型路径
 };
 
-// 一帧的视觉结果；静态手势已汇总多只手，单手姿态供动态挥手判断。
-struct CameraFrameResult {
-    bool hasHand = false;
-    vision::HandGesture gesture = vision::HandGesture::Unknown;
-    int handCount = 0;
-    vision::HandPoseResult singleHand; // 只有一只手时提供，默认无效
-    double timeSeconds = 0.0;         // 本次会话开始后的单调时间，单位为秒
-    cv::Size frameSize;               // 单手关键点所在的完整画面尺寸
-};
+// 桌面与预览共用同一种帧结果，保留名称供摄像头会话接口使用。
+using CameraFrameResult = vision::VisionFrameResult;
 
 // One session belongs entirely to the capture thread. Tests can supply frame
 // results without accessing a physical camera.
@@ -34,9 +28,11 @@ class CameraSession {
 public:
     virtual ~CameraSession() = default;
     virtual void open() = 0;
-    // 接收参数：用于接收当前帧的存在情况、静态手势、单手姿态和时间。
+    // 接收参数：用于接收当前帧的全部手部记录、汇总手势、尺寸和时间。
     // 返回值：是否成功读取并处理一帧。
     virtual bool readFrame(CameraFrameResult& result) = 0;
+    // 返回最近一次识别对应的原图；不重新采集，仅供当前后台线程绘图。
+    virtual cv::Mat frameForPreview() const { return {}; }
 };
 
 using CameraSessionFactory = std::function<std::unique_ptr<CameraSession>()>;
@@ -57,12 +53,17 @@ public:
     void setEnabled(bool enabled);
     void shutdown();
     void setDiagnosticsEnabled(bool enabled) { diagnosticsEnabled_ = enabled; }
+    // 只控制画面显示，不启动或关闭摄像头。
+    void setPreviewEnabled(bool enabled);
+    bool previewEnabled() const { return previewEnabled_; }
 
 signals:
     void visualEvent(neko::desktop::VisualEvent event);
-    // 接收参数：是否跟随、0～1的画面位置；不携带图像或OpenCV对象。
-    void gazeChanged(bool active, const QPointF& position);
+    // 接收参数：是否跟随、0～1的位置、是否仅有预测；不携带图像。
+    void gazeChanged(bool active, const QPointF& position, bool predicted);
     void frameDiagnostics(const QString& record);
+    // 图像拥有独立像素数据；空图像表示清除上一帧。
+    void previewFrameReady(const QImage& image);
     void statusChanged(const QString& status);
     void controlsChanged(bool checked, bool enabled);
 
@@ -76,6 +77,9 @@ private:
     bool stopping_ = false;
     bool failed_ = false;
     bool diagnosticsEnabled_ = false;
+    bool previewEnabled_ = false;
+    quint64 previewRevision_ = 0;
+    quint64 sessionRevision_ = 0;
 };
 
 } // namespace neko::desktop

@@ -24,8 +24,8 @@ HandPositionResult calculatePointingPosition(
             return result;
         }
 
-        // 5号关键点是食指根部，坐标已经还原到当前frame
-        const cv::Point3f& point = hand.landmarks[5];
+        // 8号关键点是食指顶部，坐标已经还原到当前frame
+        const cv::Point3f& point = hand.landmarks[8];
 
         // 排除无穷大、NaN等无效数值
         if (!std::isfinite(point.x) || !std::isfinite(point.y)) {

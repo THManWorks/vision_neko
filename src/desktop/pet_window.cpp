@@ -83,6 +83,10 @@ void PetWindow::buildMenuAndTray()
     cameraAction_->setObjectName("cameraAction");
     cameraAction_->setCheckable(true);
     connect(cameraAction_, &QAction::toggled, this, &PetWindow::cameraRequested);
+    previewAction_ = menu_->addAction(QStringLiteral("显示检测画面"));
+    previewAction_->setObjectName("previewAction");
+    previewAction_->setCheckable(true);
+    connect(previewAction_, &QAction::toggled, this, &PetWindow::previewRequested);
     menu_->addSeparator();
     menu_->addAction(QStringLiteral("显示宠物"), this, [this] { restore(); });
     menu_->addAction(QStringLiteral("挥挥手"), this, [this] { showPose(PetPose::Wave); });
@@ -139,11 +143,18 @@ void PetWindow::setCameraControls(bool checked, bool enabled)
     cameraAction_->setEnabled(enabled);
 }
 
+void PetWindow::setPreviewChecked(bool checked)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    const QSignalBlocker blocker(previewAction_);
+    previewAction_->setChecked(checked);
+}
+
 void PetWindow::tick()
 {
     const qint64 now = clock_.elapsed();
     // 推理或设备暂时卡住时，也不能让目光一直停在旧位置。
-    if (gazeActive_ && now - gazeUpdated_ >= 500) {
+    if (gazeActive_ && now - gazeMeasured_ >= 500) {
         setGazeTarget(false, QPointF(0.5, 0.5));
     }
     const double deltaSeconds = std::clamp((now - lastTick_) / 1000.0, 0.0, 0.1);
@@ -179,8 +190,8 @@ void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
             ? QStringLiteral("挥完就来！") : QStringLiteral("等你继续指路"));
         return;
     }
-    // 没有新的真实坐标时先停步；原有500ms超时负责退出跟随。
-    if (now - gazeUpdated_ > 180) {
+    // 最新跟踪目标过旧时先停步；真实测量的500ms期限负责退出跟随。
+    if (now - gazeTargetUpdated_ > 180) {
         followPosition_ = QPointF(pos());
         gazeStatusLabel_->setText(QStringLiteral("等你继续指路"));
         return;
@@ -220,10 +231,13 @@ void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
     gazeStatusLabel_->setText(QStringLiteral("追着食指跑！"));
 }
 
-void PetWindow::setGazeTarget(bool active, const QPointF& position)
+void PetWindow::setGazeTarget(bool active, const QPointF& position, bool predicted)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    const qint64 now = clock_.elapsed();
     active = active && std::isfinite(position.x()) && std::isfinite(position.y());
+    // 在入口也检查真实测量期限，防止动画计时器暂停时预测重新激活跟随。
+    if (active && predicted) active = gazeActive_ && now - gazeMeasured_ < 500;
     const bool changed = gazeActive_ != active;
     gazeActive_ = active;
     gazeStatusLabel_->setVisible(active);
@@ -231,7 +245,10 @@ void PetWindow::setGazeTarget(bool active, const QPointF& position)
         ? QPointF(std::clamp(position.x(), 0.0, 1.0),
                   std::clamp(position.y(), 0.0, 1.0))
         : QPointF(0.5, 0.5);
-    gazeUpdated_ = clock_.elapsed();
+    if (active) {
+        gazeTargetUpdated_ = now;
+        if (!predicted) gazeMeasured_ = now;
+    }
     if (changed) {
         followPosition_ = QPointF(pos());
         followMotion_ = FollowMotion{};
@@ -243,7 +260,7 @@ void PetWindow::setGazeTarget(bool active, const QPointF& position)
             followScreen_.clear();
         }
     }
-    if (active) handLostPending_ = false;
+    if (active && !predicted) handLostPending_ = false;
     // 张手后的开心闭眼、睡眠等会遮住跟随效果；挥手动画仍优先播放完。
     if (active && pose_ != PetPose::Idle && pose_ != PetPose::Wave) {
         playPose(PetPose::Idle, 0);
