@@ -2,6 +2,8 @@
 
 #include "hand_interaction.hpp"
 #include "hand_preview.hpp"
+#include "pointer_smoother.hpp"
+#include "pinch_debug_overlay.hpp"
 
 #include <QDebug>
 #include <QElapsedTimer>
@@ -134,6 +136,7 @@ protected:
             bool gazeActive = false;
             bool pinchActive = false;
             QPointF lastPinchPosition;
+            PointerSmoothingState pointerSmoothing;
             QElapsedTimer diagnosticClock;
             diagnosticClock.start();
             QString previousDiagnosticState;
@@ -153,19 +156,25 @@ protected:
                 const auto interaction = vision::updateHandInteraction(interactionState, frame);
                 // 对准光标复用本帧已有的真实测量，在确认捏合前也可显示。
                 const auto* singleHand = frame.hands.size() == 1 ? &frame.hands.front() : nullptr;
-                const bool pointerVisible = singleHand && singleHand->pinch.valid &&
+                bool pointerVisible = singleHand && singleHand->pinch.valid &&
                     std::isfinite(singleHand->pinch.position.x) &&
                     std::isfinite(singleHand->pinch.position.y);
-                emit pinchPointerChanged(pointerVisible, pointerVisible
-                    ? QPointF(singleHand->pinch.position.x, singleHand->pinch.position.y) : QPointF());
+                QPointF pointerPosition;
+                if (pointerVisible) {
+                    // 每帧只处理一次；光标、抓取命中和拖动共用同一份位置。
+                    pointerPosition = smoothDesktopPointer(pointerSmoothing,
+                        QPointF(singleHand->pinch.position.x, singleHand->pinch.position.y),
+                        frame.timeSeconds);
+                    pointerVisible = pointerSmoothing.initialized;
+                }
+                emit pinchPointerChanged(pointerVisible, pointerPosition);
                 // 直接使用统一视觉入口的状态和位置，不重复计算指尖或判断捏合。
                 const auto& pinch = interaction.pinchPosition;
                 if (interaction.pinching) {
-                    const bool measured = pinch.valid &&
+                    const bool measured = pinch.valid && pointerVisible &&
                         std::isfinite(pinch.position.x) && std::isfinite(pinch.position.y);
                     if (measured) {
-                        lastPinchPosition = QPointF(std::clamp(pinch.position.x, 0.0f, 1.0f),
-                                                   std::clamp(pinch.position.y, 0.0f, 1.0f));
+                        lastPinchPosition = pointerPosition;
                     }
                     pinchActive = true;
                     emit pinchChanged(true, lastPinchPosition, measured);
@@ -206,7 +215,11 @@ protected:
                     !previewPending_.exchange(true)) {
                     const cv::Mat source = session->frameForPreview();
                     if (!source.empty() && source.type() == CV_8UC3) {
-                        const cv::Mat annotated = vision::drawHandPreview(source, frame, interaction);
+                        cv::Mat annotated = vision::drawHandPreview(source, frame, interaction);
+                        if (diagnosticsEnabled_) {
+                            drawPinchDiagnostics(annotated, frame, interaction,
+                                                 interactionState.pinch.openFrames);
+                        }
                         cv::Mat rgb;
                         cv::cvtColor(annotated, rgb, cv::COLOR_BGR2RGB);
                         // copy() 让排队传递的图像不依赖下一帧复用的 Mat 内存。
@@ -226,12 +239,13 @@ protected:
                     const vision::HandFrameResult noHand{};
                     const auto& hand = frame.hands.size() == 1 ? frame.hands.front() : noHand;
                     const auto& wave = interactionState.wave;
-                    const QString key = QStringLiteral("%1/%2/%3/%4/%5/%6/%7/%8/%9")
+                    const QString key = QStringLiteral("%1/%2/%3/%4/%5/%6/%7/%8/%9/%10/%11")
                         .arg(static_cast<qulonglong>(frame.hands.size())).arg(hand.pose.valid)
                         .arg(QString::fromLatin1(gestureName(frame.frameGesture)))
                         .arg(gazeActive).arg(wave.turnCount)
                         .arg(hand.pointing.valid).arg(tracking.predicted)
-                        .arg(interaction.pinching).arg(pinch.valid);
+                        .arg(interaction.pinching).arg(pinch.valid).arg(pointerVisible)
+                        .arg(interactionState.pinch.openFrames);
                     if (key != previousDiagnosticState || diagnosticClock.elapsed() >= 250 ||
                         interaction.waveEvent == vision::HandWaveEvent::Waved) {
                         emit frameDiagnostics(QStringLiteral(
@@ -240,7 +254,10 @@ protected:
                             "measurement=(%11,%12) turns=%13 waved=%14 wrist_x=%15 "
                             "wave_threshold=%16 wave_direction=%17 tracking_valid=%18 "
                             "predicted=%19 target=(%20,%21) pinching=%22 "
-                            "pinch_position_valid=%23 pinch=(%24,%25) pinch_event=%26")
+                            "pinch_position_valid=%23 pinch=(%24,%25) pinch_event=%26 "
+                            "pointer_valid=%27 raw_pointer=(%28,%29) pointer=(%30,%31) pinch_ratio=%32 "
+                            "tips_px=%33 palm_px=%34 thumb_tip=(%35,%36) index_tip=(%37,%38) open_frames=%39 "
+                            "weighted_tips_px=%40")
                             .arg(frame.timeSeconds, 0, 'f', 3).arg(processingClock.elapsed())
                             .arg(frame.frameSize.width).arg(frame.frameSize.height)
                             .arg(static_cast<qulonglong>(frame.hands.size())).arg(hand.pose.valid)
@@ -254,7 +271,20 @@ protected:
                             .arg(tracking.predicted).arg(tracking.position.x)
                             .arg(tracking.position.y).arg(interaction.pinching).arg(pinch.valid)
                             .arg(pinch.position.x).arg(pinch.position.y)
-                            .arg(static_cast<int>(interaction.pinchEvent)));
+                            .arg(static_cast<int>(interaction.pinchEvent)).arg(pointerVisible)
+                            .arg(hand.pinch.position.x).arg(hand.pinch.position.y)
+                            .arg(pointerPosition.x()).arg(pointerPosition.y())
+                            .arg(hand.pinch.distanceRatio)
+                            .arg(std::hypot(hand.pose.landmarks[4].x - hand.pose.landmarks[8].x,
+                                            hand.pose.landmarks[4].y - hand.pose.landmarks[8].y))
+                            .arg(std::hypot(hand.pose.landmarks[0].x - hand.pose.landmarks[9].x,
+                                            hand.pose.landmarks[0].y - hand.pose.landmarks[9].y))
+                            .arg(hand.pose.landmarks[4].x).arg(hand.pose.landmarks[4].y)
+                            .arg(hand.pose.landmarks[8].x).arg(hand.pose.landmarks[8].y)
+                            .arg(interactionState.pinch.openFrames)
+                            .arg(hand.pinch.distanceRatio *
+                                 std::hypot(hand.pose.landmarks[0].x - hand.pose.landmarks[9].x,
+                                            hand.pose.landmarks[0].y - hand.pose.landmarks[9].y)));
                         previousDiagnosticState = key;
                         diagnosticClock.restart();
                     }

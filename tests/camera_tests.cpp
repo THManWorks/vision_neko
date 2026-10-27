@@ -3,6 +3,7 @@
 #include "hand_pose.hpp"
 #include "hand_interaction.hpp"
 #include "hand_preview.hpp"
+#include "pointer_smoother.hpp"
 
 #include <QAction>
 #include <QCoreApplication>
@@ -83,8 +84,10 @@ ScriptFrame pinchAt(double time, float x, float y, float ratio = 0.1f,
     ScriptFrame frame(time, 100.0f, valid, hands,
                       neko::vision::HandGesture::Unknown, 100.0f);
     frame.pinchObservation = true;
-    frame.thumbTip = cv::Point3f(x - ratio * 50.0f, y, 0.0f);
-    frame.indexTip = cv::Point3f(x + ratio * 50.0f, y, 0.0f);
+    // ratio 表示最终测量比例；横向距离需抵消当前 x 权重的影响。
+    const float halfDistance = ratio * 50.0f / std::sqrt(0.5f);
+    frame.thumbTip = cv::Point3f(x - halfDistance, y, 0.0f);
+    frame.indexTip = cv::Point3f(x + halfDistance, y, 0.0f);
     return frame;
 }
 
@@ -308,6 +311,62 @@ class CameraTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void cursorAndGrabReceiveTheSameSmoothedRealMeasurement()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        QSignalSpy pointers(&controller, &CameraController::pinchPointerChanged);
+        QSignalSpy grabs(&controller, &CameraController::pinchChanged);
+        controller.setEnabled(true);
+        QTRY_COMPARE(script->requestedReads.load(), 1);
+        pointers.clear();
+        grabs.clear();
+
+        const std::vector<ScriptFrame> samples{
+            pinchAt(0.01, 320, 240), pinchAt(0.03, 324, 240),
+            pinchAt(0.05, 316, 240), pinchAt(0.07, 324, 240)
+        };
+        script->append({samples[0], samples[1], samples[2], samples[3]});
+        QTRY_COMPARE(pointers.count(), 4);
+        QTRY_COMPARE(grabs.count(), 3);
+        PointerSmoothingState expectedState;
+        QPointF lastFiltered;
+        for (int sample = 0; sample < 4; ++sample) {
+            const auto observed = observedFrame(samples[sample]);
+            const auto raw = observed.hands.front().pinch.position;
+            lastFiltered = smoothDesktopPointer(expectedState, QPointF(raw.x, raw.y),
+                                                 samples[sample].timeSeconds);
+            QVERIFY(pointers.at(sample).at(0).toBool());
+            QCOMPARE(pointers.at(sample).at(1).toPointF(), lastFiltered);
+            if (sample > 0) {
+                QVERIFY(grabs.at(sample - 1).at(0).toBool());
+                QVERIFY(grabs.at(sample - 1).at(2).toBool());
+                QCOMPARE(grabs.at(sample - 1).at(1).toPointF(), lastFiltered);
+            }
+        }
+        QVERIFY(std::abs(lastFiltered.x() - 324.0 / 640.0) > 0.001);
+
+        // Missing data holds the last displayed point; it must not advance the filter.
+        script->append({pinchAt(0.1, 600, 240, 0.1f, 1, false)});
+        QTRY_COMPARE(pointers.count(), 5);
+        QTRY_COMPARE(grabs.count(), 4);
+        QVERIFY(!pointers.last().at(0).toBool());
+        QVERIFY(grabs.last().at(0).toBool());
+        QVERIFY(!grabs.last().at(2).toBool());
+        QCOMPARE(grabs.last().at(1).toPointF(), lastFiltered);
+        const auto recovery = pinchAt(0.16, 328, 240);
+        script->append({recovery});
+        QTRY_COMPARE(pointers.count(), 6);
+        const auto rawRecovery = observedFrame(recovery).hands.front().pinch.position;
+        const auto expectedRecovery = smoothDesktopPointer(expectedState,
+            QPointF(rawRecovery.x, rawRecovery.y), recovery.timeSeconds);
+        QCOMPARE(pointers.last().at(1).toPointF(), expectedRecovery);
+        QTRY_COMPARE(grabs.count(), 5);
+        QCOMPARE(grabs.last().at(1).toPointF(), expectedRecovery);
+        controller.shutdown();
+    }
+
     void pinchMeasurementUsesBothTipsAndTheOriginalFrameSize()
     {
         const auto frame = observedFrame(pinchAt(0.0, 320.0f, 240.0f));
@@ -320,6 +379,22 @@ private slots:
         auto invalid = pose;
         invalid.landmarks[4].x = std::numeric_limits<float>::quiet_NaN();
         QVERIFY(!neko::vision::measureHandPinch(invalid, frame.frameSize).valid);
+    }
+
+    void pinchWeightsChangeSeparationSensitivityWithoutMovingTheMidpoint()
+    {
+        auto pose = observedFrame(pinchAt(0.0, 320.0f, 240.0f)).hands.front().pose;
+        pose.landmarks[4] = cv::Point3f(310.0f, 240.0f, 0.0f);
+        pose.landmarks[8] = cv::Point3f(330.0f, 240.0f, 0.0f);
+        const auto horizontal = neko::vision::measureHandPinch(pose, cv::Size(640, 480));
+        pose.landmarks[4] = cv::Point3f(320.0f, 230.0f, 0.0f);
+        pose.landmarks[8] = cv::Point3f(320.0f, 250.0f, 0.0f);
+        const auto vertical = neko::vision::measureHandPinch(pose, cv::Size(640, 480));
+        QVERIFY(horizontal.valid && vertical.valid);
+        QVERIFY(horizontal.distanceRatio < 0.20f);
+        QVERIFY(vertical.distanceRatio > 0.20f);
+        QCOMPARE(horizontal.position, cv::Point2f(0.5f, 0.5f));
+        QCOMPARE(vertical.position, horizontal.position);
     }
 
     void pinchFlowsFromSharedInteractionToDesktopAndReleasesOnLoss()
@@ -366,20 +441,26 @@ private slots:
                         pinchAt(0.35, movedX, movedY, 0.3f),
                         pinchAt(0.4, movedX, movedY, 0.3f)});
         QTRY_COMPARE(updates.count(), 6);
+        QVERIFY(updates.last().at(0).toBool()); // Two open frames are insufficient now.
+        script->append({pinchAt(0.42, movedX, movedY, 0.3f),
+                        pinchAt(0.44, movedX, movedY, 0.3f),
+                        pinchAt(0.46, movedX, movedY, 0.3f),
+                        pinchAt(0.48, movedX, movedY, 0.3f)});
+        QTRY_COMPARE(updates.count(), 10); // Six uninterrupted open observations release.
         QVERIFY(!updates.last().at(0).toBool());
         QVERIFY(!pet.pinchActive());
 
         script->append({pinchAtHead(pet, 0.5), pinchAtHead(pet, 0.6),
                         pinchAtHead(pet, 0.7, 0.1f, 2)});
-        QTRY_COMPARE(updates.count(), 8);
+        QTRY_COMPARE(updates.count(), 12);
         QVERIFY(!updates.last().at(0).toBool());
         QVERIFY(!pet.pinchActive());
         script->append({pinchAtHead(pet, 0.8), pinchAtHead(pet, 0.9),
                         pinchAtHead(pet, 1.0, 0.1f, 0),
                         pinchAtHead(pet, 1.41, 0.1f, 0)});
-        QTRY_COMPARE(updates.count(), 11);
-        QVERIFY(updates.at(9).at(0).toBool());
-        QVERIFY(!updates.at(9).at(2).toBool());
+        QTRY_COMPARE(updates.count(), 15);
+        QVERIFY(updates.at(13).at(0).toBool());
+        QVERIFY(!updates.at(13).at(2).toBool());
         QVERIFY(!updates.last().at(0).toBool());
 
         script->append({pinchAtHead(pet, 1.5), pinchAtHead(pet, 1.6)});

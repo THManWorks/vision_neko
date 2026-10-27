@@ -61,9 +61,9 @@ signals:
     void visualEvent(neko::desktop::VisualEvent event);
     // 接收参数：是否跟随、0～1的位置、是否仅有预测；不携带图像。
     void gazeChanged(bool active, const QPointF& position, bool predicted);
-    // 接收参数：是否保持捏合、归一化捏合位置、本帧是否有真实位置。
+    // 接收参数：是否保持捏合、归一化平滑位置、本帧是否有真实位置参与。
     void pinchChanged(bool active, const QPointF& position, bool measured);
-    // 捏合前也显示真实两指中点，便于对准头顶；不代表已经抓住。
+    // 捏合前也显示基于真实中点的平滑光标，便于对准头顶；不代表已抓住。
     void pinchPointerChanged(bool visible, const QPointF& position);
     void frameDiagnostics(const QString& record);
     // 图像拥有独立像素数据；空图像表示清除上一帧。

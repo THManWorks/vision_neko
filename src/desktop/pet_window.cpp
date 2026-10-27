@@ -57,7 +57,7 @@ protected:
     {
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing);
-        const QColor color = property("grabbed").toBool() ? QColor("#a75bdb")
+        const QColor color = property("pinching").toBool() ? QColor("#f3a545")
             : property("headReady").toBool() ? QColor("#31c6ad") : QColor("#bc8adf");
         painter.setPen(QPen(color, 2.5));
         painter.setBrush(QColor(color.red(), color.green(), color.blue(), 35));
@@ -365,6 +365,9 @@ void PetWindow::endPinch(bool blockUntilRelease)
 void PetWindow::setPinchTarget(bool active, const QPointF& position, bool measured)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    // 颜色表示视觉确认的捏合状态，与是否命中头部、是否抓住机器人分开。
+    pinchPointerWindow_->setProperty("pinching", active);
+    pinchPointerWindow_->update();
     if (!active) {
         pinchBlocked_ = false;
         endPinch();

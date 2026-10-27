@@ -1,5 +1,6 @@
 #include "pet_window.hpp"
 #include "detection_preview.hpp"
+#include "pointer_smoother.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -38,6 +39,53 @@ class DesktopTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void desktopPointerSmoothingAttenuatesSmallAlternatingJitter()
+    {
+        PointerSmoothingState state;
+        QCOMPARE(smoothDesktopPointer(state, QPointF(0.5, 0.5), 0.0), QPointF(0.5, 0.5));
+        double rawSquaredError = 0.0;
+        double filteredSquaredError = 0.0;
+        for (int sample = 1; sample <= 60; ++sample) {
+            const double offset = sample % 2 == 0 ? -0.01 : 0.01;
+            const QPointF raw(0.5 + offset, 0.5 - offset);
+            const QPointF filtered = smoothDesktopPointer(state, raw, sample * 0.02);
+            rawSquaredError += offset * offset;
+            filteredSquaredError += std::pow(filtered.x() - 0.5, 2);
+            QVERIFY(std::isfinite(filtered.x()));
+            QVERIFY(std::isfinite(filtered.y()));
+        }
+        QVERIFY(filteredSquaredError < rawSquaredError * 0.5);
+    }
+
+    void desktopPointerSmoothingStillFollowsRealMotion()
+    {
+        PointerSmoothingState state;
+        smoothDesktopPointer(state, QPointF(0.0, 0.0), 0.0);
+        QPointF filtered;
+        for (int sample = 1; sample <= 10; ++sample)
+            filtered = smoothDesktopPointer(state, QPointF(0.8, 0.4), sample * 0.02);
+        QVERIFY(std::abs(filtered.x() - 0.8) < 0.04);
+        QVERIFY(std::abs(filtered.y() - 0.4) < 0.02);
+        for (int sample = 11; sample <= 30; ++sample)
+            filtered = smoothDesktopPointer(state, QPointF(0.8, 0.4), sample * 0.02);
+        QVERIFY(std::abs(filtered.x() - 0.8) < 0.0001);
+        QVERIFY(std::abs(filtered.y() - 0.4) < 0.0001);
+    }
+
+    void desktopPointerSmoothingResetsForLongGapsOrInvalidInput()
+    {
+        PointerSmoothingState state;
+        smoothDesktopPointer(state, QPointF(0.2, 0.3), 1.0);
+        // A long gap starts from the real new point, without extrapolating old motion.
+        QCOMPARE(smoothDesktopPointer(state, QPointF(0.8, 0.9), 1.6), QPointF(0.8, 0.9));
+        QCOMPARE(smoothDesktopPointer(state, QPointF(0.1, 0.2), 0.5), QPointF(0.1, 0.2));
+        smoothDesktopPointer(state,
+            QPointF(std::numeric_limits<double>::quiet_NaN(), 0.5), 0.6);
+        QCOMPARE(smoothDesktopPointer(state, QPointF(0.6, 0.7), 0.7), QPointF(0.6, 0.7));
+        state = PointerSmoothingState{};
+        QCOMPARE(smoothDesktopPointer(state, QPointF(2.0, -1.0), 2.0), QPointF(1.0, 0.0));
+    }
+
     void pinchDragUsesRelativeMotionAndFreezesWithoutMeasurement()
     {
         PetWindow pet;

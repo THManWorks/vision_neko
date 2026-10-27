@@ -23,9 +23,13 @@ namespace neko::vision {
         const cv::Point3f& middleBase = hand.landmarks[9]; // 中指根部
 
         // 计算两指尖的二维距离，只使用x、y
-        float tipDistance = std::hypot(
-            thumbTip.x - indexTip.x,
-            thumbTip.y - indexTip.y);
+        float dx = thumbTip.x - indexTip.x;
+        float dy = thumbTip.y - indexTip.y;
+
+        // 降低横向分离的影响，提高纵向分离的影响
+        float tipDistance = std::sqrt(
+            0.5f * dx * dx +
+            1.5f * dy * dy);
         
         // 计算掌长：手腕到中指根部的二维距离
         float palmLength = std::hypot(
@@ -80,7 +84,8 @@ namespace neko::vision {
         double nowSeconds){
             const float closeThreshold = 0.11f; // 捏合阈值
             const float openThreshold = 0.20f;  // 松开阈值
-            const int confirmFrames = 2;        // 连续两帧确认
+            const int closeConfirmFrames = 2; // 连续2帧确认捏合
+            const int openConfirmFrames = 6;  // 连续6帧确认松开
 
             const double maxMissingSeconds = 0.5;//允许短暂丢失
 
@@ -122,7 +127,7 @@ namespace neko::vision {
                 state.closeFrames = 0;
             }
             //若连续捏合数达到规定次数，则判断为捏合
-            if (state.closeFrames >= confirmFrames) {
+            if (state.closeFrames >=closeConfirmFrames) {
                 state.pinching = true;
                 state.closeFrames = 0;
                 return HandPinchEvent::Pinched;
@@ -136,7 +141,7 @@ namespace neko::vision {
                 state.openFrames = 0;
             }
 
-            if (state.openFrames >= confirmFrames) {
+            if (state.openFrames >= openConfirmFrames) {
                 state.pinching = false;
                 state.openFrames = 0;
                 return HandPinchEvent::Released;
