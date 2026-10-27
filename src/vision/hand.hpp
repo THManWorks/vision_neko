@@ -6,6 +6,7 @@
 #include "hand_pose.hpp"
 #include "hand_gesture.hpp"
 #include "hand_position.hpp"
+#include "hand_pinch.hpp"
 #include <vector>
 
 namespace neko::vision{
@@ -16,6 +17,7 @@ namespace neko::vision{
         HandPoseResult pose;    // 姿态信息：姿态有效性、21个关键点
         HandGesture gesture = HandGesture::Unknown;//识别出的手势，默认未知
         HandPositionResult pointing; // 本帧食指尖真实的位置测量
+        HandPinchMeasurement pinch; // 本帧的捏合距离测量比例结果
     };
 
     // 整帧的识别结果

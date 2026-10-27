@@ -3,6 +3,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QDir>
 #include <QImage>
 #include <QLabel>
 #include <QMouseEvent>
@@ -18,10 +19,192 @@
 
 using namespace neko::desktop;
 
+namespace {
+
+QPointF normalizedHeadTarget(const PetWindow& pet)
+{
+    auto* screen = QGuiApplication::screenAt(pet.frameGeometry().center());
+    if (!screen) screen = QGuiApplication::primaryScreen();
+    const QRect area = screen->availableGeometry();
+    const QPointF point = QPointF(pet.pos()) +
+        robotHeadGrabArea(QRectF(10, 24, 240, 256)).center();
+    return QPointF((point.x() - area.left()) / std::max(1, area.width() - 1),
+                   (point.y() - area.top()) / std::max(1, area.height() - 1));
+}
+
+} // namespace
+
 class DesktopTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void pinchDragUsesRelativeMotionAndFreezesWithoutMeasurement()
+    {
+        PetWindow pet;
+        pet.show();
+        const QRect area = QGuiApplication::primaryScreen()->availableGeometry();
+        if (area.width() < pet.width() + 150 || area.height() < pet.height() + 100)
+            QSKIP("Screen too small for a movement assertion");
+        pet.move(area.topLeft() + QPoint(30, 30));
+        const QPoint start = pet.pos();
+        const QPointF head = normalizedHeadTarget(pet);
+        QSignalSpy modes(&pet, &PetWindow::pinchModeChanged);
+        pet.setGazeTarget(true, QPointF(1.0, 1.0));
+        pet.setPinchTarget(true, head);
+        QVERIFY(pet.pinchActive());
+        QVERIFY(!pet.gazeActive());
+        QCOMPARE(pet.pos(), start); // Grabbing must not teleport to the pointer.
+        auto* label = pet.findChild<QLabel*>("pinchStatusLabel");
+        QVERIFY(label && label->isVisible());
+        QVERIFY(label->text().contains(QStringLiteral("提")));
+        pet.reactTo(VisualEvent::HandWave);
+        pet.setGazeTarget(true, QPointF(0.0, 0.0));
+        QCOMPARE(pet.pose(), PetPose::Idle);
+        QVERIFY(!pet.gazeActive());
+
+        pet.setPinchTarget(true, head + QPointF(0.2, 0.2));
+        QTest::qWait(120);
+        // Drag deltas use the full screen extent, not the smaller window-position range.
+        QVERIFY(pet.x() > start.x() + 0.70 * 0.2 * (area.width() - 1));
+        QVERIFY(pet.y() > start.y() + 0.70 * 0.2 * (area.height() - 1));
+        pet.setPinchTarget(true, QPointF(1.0, 1.0), false);
+        const QPoint frozen = pet.pos();
+        QTest::qWait(80);
+        QCOMPARE(pet.pos(), frozen);
+        QVERIFY(pet.pinchActive());
+        pet.setPinchTarget(true, QPointF(10.0, 10.0));
+        QTest::qWait(120);
+        QVERIFY(area.contains(pet.frameGeometry()));
+        pet.setPinchTarget(false, QPointF(), false);
+        const QPoint released = pet.pos();
+        QTest::qWait(70);
+        QCOMPARE(pet.pos(), released);
+        QVERIFY(!pet.pinchActive());
+        QVERIFY(!label->isVisible());
+        QCOMPARE(modes.count(), 2);
+    }
+
+    void pinchExpiresAndRequiresReleaseAfterManualInterference()
+    {
+        PetWindow pet;
+        pet.show();
+        const QPointF head = normalizedHeadTarget(pet);
+        pet.setPinchTarget(true, QPointF(0.5, 0.5), false);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(true, head);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(false, QPointF());
+        pet.setPinchTarget(true, QPointF(std::numeric_limits<double>::quiet_NaN(), 0.5));
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(true, head);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(false, QPointF());
+        pet.setPinchTarget(true, head);
+        QVERIFY(pet.pinchActive());
+        QTest::qWait(300);
+        pet.setPinchTarget(true, QPointF(0.7, 0.5), false);
+        QTest::qWait(260);
+        QVERIFY(!pet.pinchActive()); // Missing updates do not renew the 500ms deadline.
+        pet.setPinchTarget(true, head);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(false, QPointF());
+        pet.setPinchTarget(true, head);
+        QVERIFY(pet.pinchActive());
+        QTest::mousePress(&pet, Qt::LeftButton, Qt::NoModifier, QPoint(120, 140));
+        QVERIFY(!pet.pinchActive());
+        QTest::mouseRelease(&pet, Qt::LeftButton, Qt::NoModifier, QPoint(120, 140));
+        pet.setPinchTarget(true, head);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(false, QPointF());
+        pet.setPinchTarget(true, normalizedHeadTarget(pet));
+        pet.hide();
+        QVERIFY(!pet.pinchActive());
+        pet.restore();
+        pet.setPinchTarget(true, normalizedHeadTarget(pet));
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(false, QPointF());
+        pet.setPinchTarget(true, normalizedHeadTarget(pet));
+        QVERIFY(pet.pinchActive());
+        pet.setCameraControls(false, true);
+        QVERIFY(!pet.pinchActive());
+    }
+
+    void pinchMustBeginOnTheHeadAndCannotCatchWhileAlreadyClosed()
+    {
+        PetWindow pet;
+        pet.show();
+        const QRect area = QGuiApplication::primaryScreen()->availableGeometry();
+        pet.move(area.topLeft() + QPoint(30, 30));
+        const QPointF head = normalizedHeadTarget(pet);
+        QSignalSpy modes(&pet, &PetWindow::pinchModeChanged);
+
+        // Merely aiming at the head must not start a grab.
+        pet.setPinchPointer(true, head);
+        QVERIFY(!pet.pinchActive());
+        pet.setPinchTarget(true, QPointF(1.0, 1.0));
+        QVERIFY(!pet.pinchActive());
+        // The same closed pinch cannot slide onto the head and acquire it.
+        pet.setPinchTarget(true, head);
+        QVERIFY(!pet.pinchActive());
+        QCOMPARE(modes.count(), 0);
+        pet.setPinchTarget(false, head);
+        pet.setPinchTarget(true, head);
+        QVERIFY(pet.pinchActive());
+        QCOMPARE(modes.count(), 1);
+        pet.setPinchTarget(false, head);
+        QVERIFY(!pet.pinchActive());
+        QCOMPARE(modes.count(), 2);
+    }
+
+    void optionalHeadGrabVisualSnapshots()
+    {
+        const QString directory = qEnvironmentVariable("NEKO_VISUAL_QA_DIR");
+        if (directory.isEmpty()) QSKIP("Set NEKO_VISUAL_QA_DIR to export visual QA frames");
+        QVERIFY(QDir().mkpath(directory));
+        PetWindow pet;
+        pet.show();
+        const auto save = [&pet, &directory](const QString& name) {
+            QImage image(pet.size(), QImage::Format_ARGB32_Premultiplied);
+            image.fill(Qt::transparent);
+            pet.render(&image);
+            return image.save(QDir(directory).filePath(name));
+        };
+        QVERIFY(save(QStringLiteral("idle.png")));
+        const QPointF head = normalizedHeadTarget(pet);
+        pet.setPinchPointer(true, head);
+        pet.setPinchTarget(true, head);
+        QVERIFY(pet.pinchActive());
+        QTest::qWait(220);
+        pet.setPinchTarget(true, head);
+        QTest::qWait(160);
+        QVERIFY(save(QStringLiteral("held.png")));
+        pet.setPinchTarget(false, head);
+        QTest::qWait(450);
+        QVERIFY(save(QStringLiteral("released.png")));
+    }
+
+    void pinchPointerIsClickThroughAndClearsAfterStaleInputOrHide()
+    {
+        PetWindow pet;
+        pet.show();
+        auto* pointer = pet.findChild<QWidget*>("pinchPointerWindow");
+        QVERIFY(pointer);
+        QVERIFY(pointer->windowFlags().testFlag(Qt::WindowTransparentForInput));
+        QVERIFY(pointer->windowFlags().testFlag(Qt::WindowDoesNotAcceptFocus));
+        QVERIFY(pointer->testAttribute(Qt::WA_ShowWithoutActivating));
+        pet.setPinchPointer(true, normalizedHeadTarget(pet));
+        QVERIFY(pointer->isVisible());
+        QVERIFY(!pet.pinchActive());
+        QTest::qWait(300);
+        QVERIFY(!pointer->isVisible());
+        pet.setPinchPointer(true, normalizedHeadTarget(pet));
+        pet.setCameraControls(false, true);
+        QVERIFY(!pointer->isVisible());
+        pet.setPinchPointer(true, normalizedHeadTarget(pet));
+        pet.hide();
+        QVERIFY(!pointer->isVisible());
+    }
+
     void previewMenuIsIndependentAndSynchronizesWithoutSignals()
     {
         PetWindow pet;
@@ -191,6 +374,9 @@ private slots:
         const QPoint stopped = pet.pos();
         QTest::qWait(100);
         QCOMPARE(pet.pos(), stopped); // No new observation: do not keep chasing stale data.
+        QTest::qWait(290); // Following stays active beyond the old 500 ms cap.
+        QVERIFY(pet.gazeActive());
+        QCOMPARE(pet.pos(), stopped); // The 180 ms motion guard still applies.
         QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
         QCOMPARE(pet.pos(), stopped);
     }
@@ -213,7 +399,10 @@ private slots:
         auto* timer = pet.findChild<QTimer*>("animationTimer");
         QVERIFY(timer);
         timer->stop();
-        QTest::qWait(520);
+        QTest::qWait(650);
+        pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
+        QVERIFY(pet.gazeActive());
+        QTest::qWait(370); // A prediction at 650 ms must not renew the real deadline.
         pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
         QVERIFY(!pet.gazeActive());
         pet.setGazeTarget(true, QPointF(0.1, 0.9), true);
@@ -235,15 +424,16 @@ private slots:
         connect(&predictions, &QTimer::timeout, &pet,
                 [&] { pet.setGazeTarget(true, QPointF(0.1, 0.9), true); });
         predictions.start();
-        QTest::qWait(300);
+        QTest::qWait(650);
         QVERIFY(pet.gazeActive());
+        QCOMPARE(pet.pose(), PetPose::Idle); // HandLost remains pending during prediction.
         QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
         QTest::qWait(100);
         QVERIFY(!pet.gazeActive());
         QCOMPARE(pet.pose(), PetPose::Surprise);
     }
 
-    void shortPredictionsRefreshTheTrackingTargetForEyesAndChase()
+    void predictionsRefreshTheTrackingTargetForEyesAndChase()
     {
         PetWindow pet;
         pet.show();
@@ -267,7 +457,8 @@ private slots:
         QVERIFY(pet.gazePosition().y() > 0.6);
         QVERIFY(pet.pos() != stopped);
         const QPoint resumed = pet.pos();
-        QTest::qWait(80);
+        QTest::qWait(300); // Fresh predictions still drive motion at about 650 ms.
+        QVERIFY(pet.gazeActive());
         QVERIFY(pet.pos() != resumed);
     }
 
@@ -276,12 +467,14 @@ private slots:
         PetWindow pet;
         pet.show();
         pet.setGazeTarget(true, QPointF(0.1, 0.2));
-        QTest::qWait(300);
+        QTest::qWait(650);
+        QVERIFY(pet.gazeActive());
         pet.setGazeTarget(true, QPointF(0.9, 0.8));
-        QTest::qWait(300);
+        QTest::qWait(650); // Beyond both the original deadline and the old 500 ms cap.
         QVERIFY(pet.gazeActive());
         QVERIFY(pet.gazePosition().x() > 0.8);
         QVERIFY(pet.gazePosition().y() > 0.7);
+        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
     }
 
     void fingerChasePausesForUserControlAndWave_data()
@@ -462,7 +655,7 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(pet.gazePosition().x() > 0.7 &&
                                  pet.gazePosition().y() < 0.3, 350);
         QVERIFY(pet.gazeActive());
-        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 800);
+        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 1100);
         QTRY_VERIFY_WITH_TIMEOUT(std::hypot(pet.gazePosition().x() - 0.5,
                                           pet.gazePosition().y() - 0.5) < 0.01, 700);
     }
@@ -481,7 +674,10 @@ private slots:
         pet.reactTo(VisualEvent::HandLost);
         QVERIFY(pet.gazeActive());
         QCOMPARE(pet.pose(), PetPose::Wave);
-        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 800);
+        QTest::qWait(650);
+        QVERIFY(pet.gazeActive());
+        QCOMPARE(pet.pose(), PetPose::Wave);
+        QTRY_VERIFY_WITH_TIMEOUT(!pet.gazeActive(), 400);
         QCOMPARE(pet.pose(), PetPose::Wave);
         QTRY_VERIFY_WITH_TIMEOUT(pet.pose() == PetPose::Surprise, 3000);
     }

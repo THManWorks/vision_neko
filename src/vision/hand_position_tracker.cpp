@@ -90,10 +90,10 @@ namespace neko::vision {
                 std::isfinite(measurement.position.x) &&
                 std::isfinite(measurement.position.y);
 
-                // 时间倒退，或超过0.5秒没有真实测量：清空旧状态
+                // 时间倒退，或超过1秒没有真实测量：清空旧状态
                 if (state.initialized &&
                     (nowSeconds < state.lastFrameTime ||
-                    nowSeconds - state.lastMeasurementTime > 0.5)) {
+                    nowSeconds - state.lastMeasurementTime > 1.0)) {
                     resetHandPositionTracker(state);
                 }
 

@@ -9,6 +9,7 @@
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
+#include <QScreen>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
@@ -16,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <limits>
@@ -51,6 +53,8 @@ struct ScriptFrame {
     neko::vision::HandGesture gesture = neko::vision::HandGesture::Unknown;
     float palmLength = 250.0f; // At 0.2 palm length, existing scripts still need 50 pixels.
     cv::Point3f indexTip{};
+    bool pinchObservation = false;
+    cv::Point3f thumbTip{};
     cv::Size frameSize{640, 480};
     cv::Mat rawFrame;
 };
@@ -71,6 +75,36 @@ ScriptFrame withRawFrame(ScriptFrame frame, const cv::Scalar& bgr = cv::Scalar(1
 {
     frame.rawFrame = cv::Mat(frame.frameSize, CV_8UC3, bgr);
     return frame;
+}
+
+ScriptFrame pinchAt(double time, float x, float y, float ratio = 0.1f,
+                    int hands = 1, bool valid = true)
+{
+    ScriptFrame frame(time, 100.0f, valid, hands,
+                      neko::vision::HandGesture::Unknown, 100.0f);
+    frame.pinchObservation = true;
+    frame.thumbTip = cv::Point3f(x - ratio * 50.0f, y, 0.0f);
+    frame.indexTip = cv::Point3f(x + ratio * 50.0f, y, 0.0f);
+    return frame;
+}
+
+QPointF normalizedHeadTarget(const PetWindow& pet)
+{
+    auto* screen = QGuiApplication::screenAt(pet.frameGeometry().center());
+    if (!screen) screen = QGuiApplication::primaryScreen();
+    const QRect area = screen->availableGeometry();
+    const QPointF point = QPointF(pet.pos()) +
+        robotHeadGrabArea(QRectF(10, 24, 240, 256)).center();
+    return QPointF((point.x() - area.left()) / std::max(1, area.width() - 1),
+                   (point.y() - area.top()) / std::max(1, area.height() - 1));
+}
+
+ScriptFrame pinchAtHead(const PetWindow& pet, double time, float ratio = 0.1f,
+                        int hands = 1, bool valid = true)
+{
+    const QPointF point = normalizedHeadTarget(pet);
+    return pinchAt(time, float(point.x() * 640.0), float(point.y() * 480.0),
+                   ratio, hands, valid);
 }
 
 CameraFrameResult observedFrame(const ScriptFrame& input)
@@ -102,6 +136,10 @@ CameraFrameResult observedFrame(const ScriptFrame& input)
         // Deliberately differ from the tip so using landmark 5 fails the test.
         hand.pose.landmarks[5] = cv::Point3f(32.0f, 48.0f, 0.0f);
         hand.pose.landmarks[8] = input.indexTip;
+        if (input.pinchObservation) {
+            hand.pose.landmarks[4] = input.thumbTip;
+            hand.pinch = neko::vision::measureHandPinch(hand.pose, result.frameSize);
+        }
         hand.pointing = neko::vision::calculatePointingPosition(
             hand.pose, hand.gesture, result.frameSize);
         result.hands.push_back(hand);
@@ -270,6 +308,110 @@ class CameraTests : public QObject {
     Q_OBJECT
 
 private slots:
+    void pinchMeasurementUsesBothTipsAndTheOriginalFrameSize()
+    {
+        const auto frame = observedFrame(pinchAt(0.0, 320.0f, 240.0f));
+        const auto measurement = frame.hands.front().pinch;
+        QVERIFY(measurement.valid);
+        QVERIFY(std::abs(measurement.distanceRatio - 0.1f) < 0.0001f);
+        QCOMPARE(measurement.position, cv::Point2f(0.5f, 0.5f));
+        const auto& pose = frame.hands.front().pose;
+        QVERIFY(!neko::vision::measureHandPinch(pose, cv::Size()).valid);
+        auto invalid = pose;
+        invalid.landmarks[4].x = std::numeric_limits<float>::quiet_NaN();
+        QVERIFY(!neko::vision::measureHandPinch(invalid, frame.frameSize).valid);
+    }
+
+    void pinchFlowsFromSharedInteractionToDesktopAndReleasesOnLoss()
+    {
+        auto script = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({script}, calls));
+        PetWindow pet;
+        pet.show();
+        pet.move(QGuiApplication::primaryScreen()->availableGeometry().topLeft() + QPoint(30, 30));
+        connect(&controller, &CameraController::pinchChanged, &pet, &PetWindow::setPinchTarget);
+        connect(&controller, &CameraController::pinchPointerChanged, &pet, &PetWindow::setPinchPointer);
+        connect(&controller, &CameraController::visualEvent, &pet, &PetWindow::reactTo);
+        connect(&controller, &CameraController::controlsChanged, &pet, &PetWindow::setCameraControls);
+        QSignalSpy updates(&controller, &CameraController::pinchChanged);
+        QSignalSpy pointers(&controller, &CameraController::pinchPointerChanged);
+        controller.setEnabled(true);
+        QTRY_COMPARE(script->requestedReads.load(), 1);
+        updates.clear();
+        pointers.clear();
+        const QPointF head = normalizedHeadTarget(pet);
+        script->append({pinchAtHead(pet, 0.01), pinchAtHead(pet, 0.02)});
+        QTRY_COMPARE(updates.count(), 1);
+        QCOMPARE(pointers.count(), 2);
+        QVERIFY(pointers.last().at(0).toBool());
+        QVERIFY(updates.last().at(0).toBool());
+        QVERIFY(updates.last().at(2).toBool());
+        const auto firstPosition = updates.last().at(1).toPointF();
+        QVERIFY(std::abs(firstPosition.x() - head.x()) < 0.0001);
+        QVERIFY(std::abs(firstPosition.y() - head.y()) < 0.0001);
+        QVERIFY(pet.pinchActive());
+
+        const float movedX = float((head.x() + 0.1) * 640.0);
+        const float movedY = float(head.y() * 480.0);
+        script->append({pinchAt(0.1, movedX, movedY),
+                        pinchAt(0.2, movedX, movedY, 0.1f, 1, false)});
+        QTRY_COMPARE(updates.count(), 3);
+        QVERIFY(updates.last().at(0).toBool());
+        QVERIFY(!updates.last().at(2).toBool());
+        const QPoint frozen = pet.pos();
+        QTest::qWait(30);
+        QCOMPARE(pet.pos(), frozen);
+        script->append({pinchAt(0.3, movedX, movedY, 0.15f),
+                        pinchAt(0.35, movedX, movedY, 0.3f),
+                        pinchAt(0.4, movedX, movedY, 0.3f)});
+        QTRY_COMPARE(updates.count(), 6);
+        QVERIFY(!updates.last().at(0).toBool());
+        QVERIFY(!pet.pinchActive());
+
+        script->append({pinchAtHead(pet, 0.5), pinchAtHead(pet, 0.6),
+                        pinchAtHead(pet, 0.7, 0.1f, 2)});
+        QTRY_COMPARE(updates.count(), 8);
+        QVERIFY(!updates.last().at(0).toBool());
+        QVERIFY(!pet.pinchActive());
+        script->append({pinchAtHead(pet, 0.8), pinchAtHead(pet, 0.9),
+                        pinchAtHead(pet, 1.0, 0.1f, 0),
+                        pinchAtHead(pet, 1.41, 0.1f, 0)});
+        QTRY_COMPARE(updates.count(), 11);
+        QVERIFY(updates.at(9).at(0).toBool());
+        QVERIFY(!updates.at(9).at(2).toBool());
+        QVERIFY(!updates.last().at(0).toBool());
+
+        script->append({pinchAtHead(pet, 1.5), pinchAtHead(pet, 1.6)});
+        QTRY_VERIFY(pet.pinchActive());
+        controller.setEnabled(false);
+        QVERIFY(!pet.pinchActive());
+        QTRY_VERIFY(!controller.busy());
+    }
+
+    void stalePinchCannotCrossCameraSessionsAndReadFailureReleases()
+    {
+        auto first = std::make_shared<Script>();
+        auto second = std::make_shared<Script>();
+        auto calls = std::make_shared<std::atomic<int>>(0);
+        CameraController controller(scriptedFactory({first, second}, calls));
+        PetWindow pet;
+        pet.show();
+        connect(&controller, &CameraController::pinchChanged, &pet, &PetWindow::setPinchTarget);
+        first->append({pinchAtHead(pet, 0.01), pinchAtHead(pet, 0.02)});
+        controller.setEnabled(true);
+        QVERIFY(first->waitForRequestedReads(3)); // Active signal queued, GUI not dispatched yet.
+        controller.shutdown();
+        controller.setEnabled(true);
+        QCoreApplication::processEvents();
+        QVERIFY(!pet.pinchActive());
+        second->append({pinchAtHead(pet, 0.01), pinchAtHead(pet, 0.02)});
+        QTRY_VERIFY(pet.pinchActive());
+        second->append({Frame::ReadFailure});
+        QTRY_VERIFY(!controller.busy());
+        QVERIFY(!pet.pinchActive());
+    }
+
     void previewToggleWithoutCameraOnlyClearsTheDisplay()
     {
         auto script = std::make_shared<Script>();
@@ -621,7 +763,7 @@ private slots:
         controller.shutdown();
     }
 
-    void uncertainInputsStreamSharedPredictionsUntilHalfASecond_data()
+    void uncertainInputsStreamSharedPredictionsUntilOneSecond_data()
     {
         QTest::addColumn<int>("reason");
         QTest::newRow("unknown") << 0;
@@ -631,7 +773,7 @@ private slots:
         QTest::newRow("missing-frame-size") << 4;
     }
 
-    void uncertainInputsStreamSharedPredictionsUntilHalfASecond()
+    void uncertainInputsStreamSharedPredictionsUntilOneSecond()
     {
         QFETCH(int, reason);
         auto script = std::make_shared<Script>();
@@ -658,32 +800,39 @@ private slots:
         else if (reason == 2) gap.handCount = 0;
         else if (reason == 3) gap.indexTip.x = std::numeric_limits<float>::quiet_NaN();
         else gap.frameSize = cv::Size();
+        auto afterHalfASecond = gap;
+        afterHalfASecond.timeSeconds = 0.75;
         auto boundary = gap;
-        boundary.timeSeconds = 0.625; // Exactly 0.5 seconds since the last real sample.
+        boundary.timeSeconds = 1.125; // Exactly one second since the last real sample.
         const auto gapExpected = neko::vision::updateHandInteraction(
             reference, observedFrame(gap));
+        const auto afterHalfASecondExpected = neko::vision::updateHandInteraction(
+            reference, observedFrame(afterHalfASecond));
         const auto boundaryExpected = neko::vision::updateHandInteraction(
             reference, observedFrame(boundary));
-        script->append({gap, boundary});
-        QTRY_COMPARE(gaze.count(), 4);
+        script->append({gap, afterHalfASecond, boundary});
+        QTRY_COMPARE(gaze.count(), 5);
         QVERIFY(gaze.at(2).at(0).toBool());
         QVERIFY(gaze.at(2).at(2).toBool());
         QCOMPARE(gaze.at(2).at(1).toPointF(), trackingPosition(gapExpected));
         QVERIFY(gaze.at(3).at(0).toBool());
         QVERIFY(gaze.at(3).at(2).toBool());
-        QCOMPARE(gaze.at(3).at(1).toPointF(), trackingPosition(boundaryExpected));
+        QCOMPARE(gaze.at(3).at(1).toPointF(), trackingPosition(afterHalfASecondExpected));
+        QVERIFY(gaze.at(4).at(0).toBool());
+        QVERIFY(gaze.at(4).at(2).toBool());
+        QCOMPARE(gaze.at(4).at(1).toPointF(), trackingPosition(boundaryExpected));
         QVERIFY(gaze.at(2).at(1).toPointF().x() > trackingPosition(secondExpected).x());
 
         // A real sample after the prediction window initializes a fresh tracker.
-        script->append({pointingAt(160, 360, 0.7)});
-        QTRY_COMPARE(gaze.count(), 5);
+        script->append({pointingAt(160, 360, 1.25)});
+        QTRY_COMPARE(gaze.count(), 6);
         QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
         QVERIFY(!gaze.last().at(2).toBool());
         controller.shutdown();
     }
 
-    void uncertainInputLongerThanHalfASecondClearsGazeOnceAndResetsTracking()
+    void uncertainInputLongerThanOneSecondClearsGazeOnceAndResetsTracking()
     {
         auto script = std::make_shared<Script>();
         auto calls = std::make_shared<std::atomic<int>>(0);
@@ -703,17 +852,27 @@ private slots:
         gap.timeSeconds = 0.51;
         script->append({gap});
         QTRY_COMPARE(gaze.count(), 3);
+        QVERIFY(gaze.last().at(0).toBool());
+        QVERIFY(gaze.last().at(2).toBool());
+        gap.timeSeconds = 0.99;
+        script->append({gap});
+        QTRY_COMPARE(gaze.count(), 4);
+        QVERIFY(gaze.last().at(0).toBool());
+        QVERIFY(gaze.last().at(2).toBool());
+        gap.timeSeconds = 1.01;
+        script->append({gap});
+        QTRY_COMPARE(gaze.count(), 5);
         QVERIFY(!gaze.last().at(0).toBool());
         QVERIFY(!gaze.last().at(2).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.5, 0.5));
 
-        gap.timeSeconds = 0.6;
+        gap.timeSeconds = 1.1;
         script->append({gap});
-        QTRY_VERIFY(script->requestedReads.load() >= 5);
+        QTRY_VERIFY(script->requestedReads.load() >= 7);
         QCoreApplication::sendPostedEvents(&controller, QEvent::MetaCall);
-        QCOMPARE(gaze.count(), 3); // Continued invalid frames do not repeat the clear.
-        script->append({pointingAt(160, 360, 0.7)});
-        QTRY_COMPARE(gaze.count(), 4);
+        QCOMPARE(gaze.count(), 5); // Continued invalid frames do not repeat the clear.
+        script->append({pointingAt(160, 360, 1.2)});
+        QTRY_COMPARE(gaze.count(), 6);
         QVERIFY(gaze.last().at(0).toBool());
         QCOMPARE(gaze.last().at(1).toPointF(), QPointF(0.25, 0.75));
         QVERIFY(!gaze.last().at(2).toBool());

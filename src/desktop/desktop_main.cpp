@@ -165,7 +165,22 @@ int main(int argc, char** argv)
             .arg(active).arg(predicted).arg(position.x(), 0, 'f', 3)
             .arg(position.y(), 0, 'f', 3));
     });
+    QObject::connect(&camera, &CameraController::pinchChanged,
+                     &pet, [&pet, writeTrace](bool active, const QPointF& position,
+                                              bool measured) {
+        pet.setPinchTarget(active, position, measured);
+        writeTrace(QStringLiteral("ui pinch_target active=%1 measured=%2 x=%3 y=%4")
+            .arg(active).arg(measured).arg(position.x(), 0, 'f', 3)
+            .arg(position.y(), 0, 'f', 3));
+    });
+    QObject::connect(&camera, &CameraController::pinchPointerChanged,
+                     &pet, &PetWindow::setPinchPointer);
     if (tracing) {
+        QObject::connect(&pet, &PetWindow::pinchModeChanged, &pet,
+                         [&pet, writeTrace](bool active) {
+            writeTrace(QStringLiteral("ui pinch_active=%1 window=(%2,%3)")
+                .arg(active).arg(pet.x()).arg(pet.y()));
+        });
         QObject::connect(&camera, &CameraController::frameDiagnostics, &pet, writeTrace);
         QObject::connect(&pet, &PetWindow::gazeModeChanged, &pet,
                          [&pet, writeTrace](bool active) {

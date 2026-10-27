@@ -15,6 +15,8 @@
 #include <utility>
 #include <chrono>
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 
 namespace neko::desktop {
 namespace {
@@ -110,6 +112,8 @@ signals:
     // 接收参数：视觉模块确认后，准备发送给桌面的静态或动态手势事件。
     void gestureConfirmed(neko::desktop::VisualEvent event);
     void gazeChanged(bool active, const QPointF& position, bool predicted);
+    void pinchChanged(bool active, const QPointF& position, bool measured);
+    void pinchPointerChanged(bool visible, const QPointF& position);
     void frameDiagnostics(const QString& record);
     void previewReady(quint64 generation, const QImage& image);
     void failed(const QString& message);
@@ -128,6 +132,8 @@ protected:
             // 跨帧状态归统一视觉模块管理，每次摄像头会话独立创建。
             vision::HandInteractionState interactionState;
             bool gazeActive = false;
+            bool pinchActive = false;
+            QPointF lastPinchPosition;
             QElapsedTimer diagnosticClock;
             diagnosticClock.start();
             QString previousDiagnosticState;
@@ -145,6 +151,28 @@ protected:
                 if (isInterruptionRequested()) break;
                 // 与预览共用整套跨帧处理，空手帧也更新预测和失踪计时。
                 const auto interaction = vision::updateHandInteraction(interactionState, frame);
+                // 对准光标复用本帧已有的真实测量，在确认捏合前也可显示。
+                const auto* singleHand = frame.hands.size() == 1 ? &frame.hands.front() : nullptr;
+                const bool pointerVisible = singleHand && singleHand->pinch.valid &&
+                    std::isfinite(singleHand->pinch.position.x) &&
+                    std::isfinite(singleHand->pinch.position.y);
+                emit pinchPointerChanged(pointerVisible, pointerVisible
+                    ? QPointF(singleHand->pinch.position.x, singleHand->pinch.position.y) : QPointF());
+                // 直接使用统一视觉入口的状态和位置，不重复计算指尖或判断捏合。
+                const auto& pinch = interaction.pinchPosition;
+                if (interaction.pinching) {
+                    const bool measured = pinch.valid &&
+                        std::isfinite(pinch.position.x) && std::isfinite(pinch.position.y);
+                    if (measured) {
+                        lastPinchPosition = QPointF(std::clamp(pinch.position.x, 0.0f, 1.0f),
+                                                   std::clamp(pinch.position.y, 0.0f, 1.0f));
+                    }
+                    pinchActive = true;
+                    emit pinchChanged(true, lastPinchPosition, measured);
+                } else if (pinchActive) {
+                    pinchActive = false;
+                    emit pinchChanged(false, QPointF(), false);
+                }
                 if (interaction.presenceEvent == vision::HandPresenceEvent::Appeared)
                     emit presenceChanged(true);
                 else if (interaction.presenceEvent == vision::HandPresenceEvent::Disappeared)
@@ -159,7 +187,7 @@ protected:
 
                 // 直接传递视觉模块的校正/预测结果，不另加识别门槛或丢失计时。
                 const auto& tracking = interaction.tracking;
-                if (tracking.valid) {
+                if (tracking.valid && !interaction.pinching) {
                     gazeActive = true;
                     emit gazeChanged(true,
                         QPointF(tracking.position.x, tracking.position.y), tracking.predicted);
@@ -198,11 +226,12 @@ protected:
                     const vision::HandFrameResult noHand{};
                     const auto& hand = frame.hands.size() == 1 ? frame.hands.front() : noHand;
                     const auto& wave = interactionState.wave;
-                    const QString key = QStringLiteral("%1/%2/%3/%4/%5/%6/%7")
+                    const QString key = QStringLiteral("%1/%2/%3/%4/%5/%6/%7/%8/%9")
                         .arg(static_cast<qulonglong>(frame.hands.size())).arg(hand.pose.valid)
                         .arg(QString::fromLatin1(gestureName(frame.frameGesture)))
                         .arg(gazeActive).arg(wave.turnCount)
-                        .arg(hand.pointing.valid).arg(tracking.predicted);
+                        .arg(hand.pointing.valid).arg(tracking.predicted)
+                        .arg(interaction.pinching).arg(pinch.valid);
                     if (key != previousDiagnosticState || diagnosticClock.elapsed() >= 250 ||
                         interaction.waveEvent == vision::HandWaveEvent::Waved) {
                         emit frameDiagnostics(QStringLiteral(
@@ -210,7 +239,8 @@ protected:
                             "confidence=%7 raw=%8 pointing_valid=%9 gaze_active=%10 "
                             "measurement=(%11,%12) turns=%13 waved=%14 wrist_x=%15 "
                             "wave_threshold=%16 wave_direction=%17 tracking_valid=%18 "
-                            "predicted=%19 target=(%20,%21)")
+                            "predicted=%19 target=(%20,%21) pinching=%22 "
+                            "pinch_position_valid=%23 pinch=(%24,%25) pinch_event=%26")
                             .arg(frame.timeSeconds, 0, 'f', 3).arg(processingClock.elapsed())
                             .arg(frame.frameSize.width).arg(frame.frameSize.height)
                             .arg(static_cast<qulonglong>(frame.hands.size())).arg(hand.pose.valid)
@@ -222,7 +252,9 @@ protected:
                             .arg(hand.pose.landmarks[0].x).arg(wave.moveThreshold)
                             .arg(static_cast<int>(wave.direction)).arg(tracking.valid)
                             .arg(tracking.predicted).arg(tracking.position.x)
-                            .arg(tracking.position.y));
+                            .arg(tracking.position.y).arg(interaction.pinching).arg(pinch.valid)
+                            .arg(pinch.position.x).arg(pinch.position.y)
+                            .arg(static_cast<int>(interaction.pinchEvent)));
                         previousDiagnosticState = key;
                         diagnosticClock.restart();
                     }
@@ -291,6 +323,8 @@ void CameraController::start()
     stopping_ = false;
     failed_ = false;
     emit gazeChanged(false, QPointF(0.5, 0.5), false);
+    emit pinchChanged(false, QPointF(), false);
+    emit pinchPointerChanged(false, QPointF());
     emit previewFrameReady(QImage{});
 
     connect(worker, &CameraWorker::ready, this, [this, worker, session] {
@@ -318,6 +352,18 @@ void CameraController::start()
         if (sessionRevision_ == session && worker_ == worker && active_ && !stopping_)
             emit frameDiagnostics(record);
     }, Qt::QueuedConnection);
+    connect(worker, &CameraWorker::pinchChanged, this,
+            [this, worker, session](bool active, const QPointF& position, bool measured) {
+        if (sessionRevision_ == session && worker_ == worker && active_ && !stopping_) {
+            emit pinchChanged(active, position, measured);
+        }
+    }, Qt::QueuedConnection);
+    connect(worker, &CameraWorker::pinchPointerChanged, this,
+            [this, worker, session](bool visible, const QPointF& position) {
+        if (sessionRevision_ == session && worker_ == worker && active_ && !stopping_) {
+            emit pinchPointerChanged(visible, position);
+        }
+    }, Qt::QueuedConnection);
     connect(worker, &CameraWorker::previewReady, this,
             [this, worker, session](quint64 generation, const QImage& image) {
         if (sessionRevision_ != session || worker_ != worker) return;
@@ -331,6 +377,8 @@ void CameraController::start()
         failed_ = true;
         active_ = false;
         emit gazeChanged(false, QPointF(0.5, 0.5), false);
+        emit pinchChanged(false, QPointF(), false);
+        emit pinchPointerChanged(false, QPointF());
         emit previewFrameReady(QImage{});
         emit statusChanged(message);
         emit controlsChanged(false, false);
@@ -341,6 +389,8 @@ void CameraController::start()
         active_ = false;
         stopping_ = false;
         emit gazeChanged(false, QPointF(0.5, 0.5), false);
+        emit pinchChanged(false, QPointF(), false);
+        emit pinchPointerChanged(false, QPointF());
         emit previewFrameReady(QImage{});
         if (!failed_) emit statusChanged(QStringLiteral("未开启"));
         emit controlsChanged(false, true);
@@ -361,6 +411,8 @@ void CameraController::stop()
     active_ = false;
     stopping_ = true;
     emit gazeChanged(false, QPointF(0.5, 0.5), false);
+    emit pinchChanged(false, QPointF(), false);
+    emit pinchPointerChanged(false, QPointF());
     emit previewFrameReady(QImage{});
     worker_->requestInterruption();
     emit controlsChanged(false, false);
@@ -375,6 +427,8 @@ void CameraController::shutdown()
     ++previewRevision_;
     if (worker_) worker_->setPreviewGeneration(0);
     emit gazeChanged(false, QPointF(0.5, 0.5), false);
+    emit pinchChanged(false, QPointF(), false);
+    emit pinchPointerChanged(false, QPointF());
     emit previewFrameReady(QImage{});
     if (!worker_) return;
     disconnect(worker_, nullptr, this, nullptr);

@@ -67,6 +67,39 @@ HandInteractionResult updateHandInteraction(
             hand.pointing,
             frame.timeSeconds);
     }
+    //------捏合判断-------
+    if (handCount > 1) {
+        // 多手时无法确定由哪只手控制
+        //先保存旧值，是为了重置后还能下面的if判断
+        bool wasPinching = state.pinch.pinching;
+        //创建一份各成员采用默认值的新状态，再赋给 state.pinch，相当于重置
+        state.pinch = HandPinchState{};
+
+        //如果在捏合，立即结束
+        if (wasPinching) {
+            result.pinchEvent = HandPinchEvent::Released;
+        }
+
+    } else {
+        // 复用本帧已经计算好的捏合测量hand.pinch
+        //无手时传入默认无效测量，历史捏合状态由函数处理短暂丢失和超时
+        result.pinchEvent = updateHandPinch(
+            state.pinch,//跨帧保存的捏合状态
+            hand.pinch,//食指尖和拇指尖的距离数据
+            frame.timeSeconds);
+    }
+
+    // 将更新后的持续状态也保存到本帧结果中
+    result.pinching = state.pinch.pinching;
+
+    // 只有确认捏合、只有一只手且本帧测量有效时，输出拖动位置
+    if (result.pinching &&
+        handCount == 1 &&
+        hand.pinch.valid) 
+        {
+        result.pinchPosition.valid = true;
+        result.pinchPosition.position = hand.pinch.position;
+    }
 
     return result;
 

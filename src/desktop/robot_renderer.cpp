@@ -112,19 +112,20 @@ void drawWaveTrail(QPainter& painter, double time)
 }
 
 void drawArm(QPainter& painter, bool right, PetPose pose, double time,
-             bool running, double runPhase)
+             bool running, double runPhase, double carryLift)
 {
     painter.save();
-    painter.translate(right ? 162.0 : 78.0, 163.0);
+    painter.translate(right ? 162.0 : 78.0, 163.0 + 10.0 * carryLift);
     const bool waving = right && pose == PetPose::Wave;
     const double angle = waving
         ? -118.0 + std::sin(time * 8.0) * 20.0
         : (right ? -18.0 : 18.0) + (running
             ? std::sin(runPhase + (right ? 0.0 : pi)) * 28.0
             : std::sin(time * 2.0) * 3.0);
-    painter.rotate(angle);
+    const double danglingAngle = (right ? -3.0 : 3.0) + std::sin(time * 2.5) * 2.0;
+    painter.rotate(angle * (1.0 - carryLift) + danglingAngle * carryLift);
     // 挥手时伸出手臂，让手掌和光点露在头部外侧。
-    const double handOffset = waving ? 10.0 : 0.0;
+    const double handOffset = (waving ? 10.0 : 0.0) + 7.0 * carryLift;
 
     painter.setPen(QPen(outline, 2.2, Qt::SolidLine, Qt::RoundCap));
     painter.setBrush(QColor("#6a94a1"));
@@ -203,9 +204,19 @@ void drawEyes(QPainter& painter, PetPose pose, double time, const QPointF& gaze,
 
 } // namespace
 
+QRectF robotHeadGrabArea(const QRectF& bounds)
+{
+    if (bounds.isEmpty()) return {};
+    const double scale = std::min(bounds.width() / 240.0, bounds.height() / 256.0);
+    const QPointF origin(bounds.center().x() - 120.0 * scale,
+                         bounds.center().y() - 128.0 * scale);
+    return QRectF(origin + QPointF(60.0, 38.0) * scale,
+                  QSizeF(120.0, 50.0) * scale);
+}
+
 void paintRobot(QPainter& painter, const QRectF& bounds,
                 PetPose pose, double elapsedSeconds, const QPointF& gazePosition,
-                bool following, const FollowMotion& motion)
+                bool following, const FollowMotion& motion, const CarryMotion& carry)
 {
     if (bounds.isEmpty()) return;
     painter.save();
@@ -217,6 +228,12 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.scale(scale, scale);
 
     const double time = std::max(0.0, elapsedSeconds);
+    const double lift = std::isfinite(carry.lift) ? std::clamp(carry.lift, 0.0, 1.0) : 0.0;
+    const double sway = std::isfinite(carry.swayDegrees)
+        ? std::clamp(carry.swayDegrees, -8.0, 8.0) * lift : 0.0;
+    // 悬挂时采用睁大的眼睛，不再播放奔跑、挥手或闭眼动作。
+    if (lift > 0.01) pose = PetPose::Surprise;
+    following = following && lift <= 0.01;
     const bool sleeping = pose == PetPose::Sleep;
     const bool running = following && motion.running && !sleeping && pose != PetPose::Wave;
     const double runPhase = std::isfinite(motion.phase) ? motion.phase : 0.0;
@@ -225,19 +242,31 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
                      * (sleeping ? 1.5 : 3.0);
 
     // Ground glow stays still while the body breathes above it.
-    QRadialGradient shadow(QPointF(120, 235), 62);
-    shadow.setColorAt(0, QColor(20, 61, 77, 65));
-    shadow.setColorAt(0.65, QColor(20, 61, 77, 22));
+    const double shadowWidth = 124.0 - 42.0 * lift;
+    const double shadowHeight = 18.0 - 12.0 * lift;
+    const double shadowY = 235.0 + 17.0 * lift;
+    const double shadowOpacity = 1.0 - 0.85 * lift;
+    QRadialGradient shadow(QPointF(120, shadowY), shadowWidth / 2.0);
+    shadow.setColorAt(0, QColor(20, 61, 77, qRound(65.0 * shadowOpacity)));
+    shadow.setColorAt(0.65, QColor(20, 61, 77, qRound(22.0 * shadowOpacity)));
     shadow.setColorAt(1, QColor(20, 61, 77, 0));
     painter.setPen(Qt::NoPen);
     painter.setBrush(shadow);
-    painter.drawEllipse(QRectF(58, 226, 124, 18));
+    painter.drawEllipse(QRectF(120 - shadowWidth / 2.0,
+                              shadowY - shadowHeight / 2.0, shadowWidth, shadowHeight));
 
     painter.save();
     const double happyBounce = pose == PetPose::Happy && time < 0.65
         ? -7.0 * std::sin(pi * time / 0.65) : 0.0;
     const double runningBounce = running ? -5.0 * std::abs(std::sin(runPhase)) : 0.0;
-    painter.translate(0, bob + happyBounce + runningBounce + (sleeping ? 3.0 : 0.0));
+    painter.translate(0, (bob + happyBounce + runningBounce + (sleeping ? 3.0 : 0.0))
+                         * (1.0 - lift));
+    if (lift > 0.0) {
+        // 头顶是固定的悬挂支点，防止视觉抓取点随着动画离开指尖。
+        painter.translate(120, 63);
+        painter.rotate(sway);
+        painter.translate(-120, -63);
+    }
     if (running) {
         painter.translate(120, 190);
         painter.rotate(direction * 5.0);
@@ -260,22 +289,38 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
         if (running) painter.translate(std::sin(phase) * 8.0,
                                        -std::max(0.0, std::cos(phase)) * 4.0);
         const double legX = leg == 0 ? 87.0 : 127.0;
+        if (lift > 0.0) {
+            const double legCenter = legX + 13.0;
+            painter.translate(legCenter, 207);
+            painter.rotate((leg == 0 ? -13.0 : 13.0) * lift);
+            painter.translate(-legCenter, -207);
+            // 细腿从躯干下方垂下，脚尖朝下，不再保持站立的平脚。
+            painter.setPen(QPen(outline, 7.0, Qt::SolidLine, Qt::RoundCap));
+            painter.drawLine(QPointF(legCenter, 209), QPointF(legCenter, 229));
+            painter.setPen(QPen(QColor("#a9cbd1"), 3.0, Qt::SolidLine, Qt::RoundCap));
+            painter.drawLine(QPointF(legCenter, 210), QPointF(legCenter, 229));
+        }
         painter.setPen(QPen(outline, 2.4));
         painter.setBrush(shellGradient(204, 230));
-        painter.drawRoundedRect(QRectF(legX, 206, 26, 23), 9, 9);
+        painter.drawRoundedRect(QRectF(legX + 4.0 * lift, 206 + 12.0 * lift,
+                                      26 - 8.0 * lift, 23 + 2.0 * lift), 9, 9);
         painter.setPen(QPen(QColor("#82a9b1"), 2, Qt::SolidLine, Qt::RoundCap));
-        painter.drawLine(QPointF(legX + 6, 224), QPointF(legX + 20, 224));
+        painter.drawLine(QPointF(legX + 6 + 3.0 * lift, 224 + 12.0 * lift),
+                         QPointF(legX + 20 - 3.0 * lift, 224 + 12.0 * lift));
         painter.restore();
     }
-    drawArm(painter, false, pose, time, running, runPhase);
-    drawArm(painter, true, pose, time, running, runPhase);
+    drawArm(painter, false, pose, time, running, runPhase, lift);
+    drawArm(painter, true, pose, time, running, runPhase, lift);
 
+    painter.save();
+    const double bodyDrop = 10.0 * lift;
+    painter.translate(0, bodyDrop);
     painter.setPen(QPen(outline, 2.5));
     painter.setBrush(shellGradient(145, 215));
-    painter.drawRoundedRect(QRectF(77, 145, 86, 70), 24, 24);
+    painter.drawRoundedRect(QRectF(77, 145, 86, 70 + 6.0 * lift), 24, 24);
     painter.setPen(Qt::NoPen);
     painter.setBrush(QColor("#93b9c2"));
-    painter.drawRoundedRect(QRectF(105, 141, 30, 12), 4, 4);
+    painter.drawRoundedRect(QRectF(105, 141 - bodyDrop, 30, 12 + bodyDrop), 4, 4);
 
     // A compact illuminated chest panel gives the robot its own identity.
     painter.setBrush(dark);
@@ -287,6 +332,7 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.drawLine(QPointF(117, 187), QPointF(129, 176));
     painter.setPen(QPen(QColor("#96b8c0"), 1.5));
     painter.drawLine(QPointF(110, 205), QPointF(130, 205));
+    painter.restore();
 
     // Cat-like antenna fins, inset with mint light.
     painter.setPen(QPen(outline, 2.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
@@ -335,6 +381,34 @@ void paintRobot(QPainter& painter, const QRectF& bounds,
     painter.drawEllipse(QRectF(158, 121, 12, 5));
     painter.setBrush(mint);
     painter.drawEllipse(QPointF(120, 70), 2, 2);
+
+    if (lift > 0.0) {
+        painter.save();
+        painter.setOpacity(lift);
+        // 两侧夹持臂抱住头顶，明确表示“被捏住提起”，而非跟随光标。
+        const QColor grip("#ad78df");
+        painter.setPen(QPen(grip, 4.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        painter.setBrush(QColor(225, 201, 250, 170));
+        QPainterPath clasp;
+        clasp.moveTo(120, 45);
+        clasp.lineTo(120, 53);
+        clasp.moveTo(120, 53);
+        clasp.quadTo(104, 52, 103, 65);
+        clasp.lineTo(109, 69);
+        clasp.moveTo(120, 53);
+        clasp.quadTo(136, 52, 137, 65);
+        clasp.lineTo(131, 69);
+        painter.drawPath(clasp);
+        painter.setPen(QPen(QColor("#e9d9ff"), 2.0));
+        painter.drawEllipse(QPointF(120, 63), 5, 5);
+        painter.setPen(QPen(QColor(173, 120, 223, 150), 2.0, Qt::SolidLine, Qt::RoundCap));
+        for (double side : {-1.0, 1.0}) {
+            const double x = 120 + side * 67;
+            painter.drawLine(QPointF(x, 183), QPointF(x, 169));
+            painter.drawLine(QPointF(x, 169), QPointF(x - side * 4, 174));
+        }
+        painter.restore();
+    }
 
     if (pose == PetPose::Happy) {
         painter.setBrush(QColor("#ffe599"));

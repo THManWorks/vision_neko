@@ -15,13 +15,14 @@ namespace {
 
 // 本文件使用的辅助函数：集中打印本帧产生的事件
 void printHandEvents(const HandInteractionResult& result)
-{
+{   
+    //手部存在输出
     if (result.presenceEvent == HandPresenceEvent::Appeared) {
         std::cout << "Hand appeared\n";
     } else if (result.presenceEvent == HandPresenceEvent::Disappeared) {
         std::cout << "Hand disappeared\n";
     }
-
+    //手势输出
     if (result.gestureEvent == HandGestureEvent::OpenPalmConfirmed) {
         std::cout << "OpenPalm confirmed\n";
     } else if (result.gestureEvent == HandGestureEvent::FistConfirmed) {
@@ -31,9 +32,15 @@ void printHandEvents(const HandInteractionResult& result)
     } else if (result.gestureEvent == HandGestureEvent::Cleared) {
         std::cout << "Gesture cleared\n";
     }
-
+    //挥手输出
     if (result.waveEvent == HandWaveEvent::Waved) {
         std::cout << "Hand wave\n";
+    }
+    //捏合判断输出
+    if (result.pinchEvent == HandPinchEvent::Pinched) {
+        std::cout << "Pinched\n";
+    } else if (result.pinchEvent == HandPinchEvent::Released) {
+        std::cout << "Released\n";
     }
 }
 

@@ -60,6 +60,8 @@ namespace neko::vision{
             hand.pointing = calculatePointingPosition(
                 hand.pose, hand.gesture, result.frameSize);
 
+            // 测量捏合距离比例得到
+            hand.pinch = measureHandPinch(hand.pose,result.frameSize);
             }
 
             // 保留这个手掌的记录(即使姿态识别失败)

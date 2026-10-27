@@ -25,6 +25,54 @@
 
 namespace neko::desktop {
 
+namespace {
+// 桌面允许预测延续的上限，从最近一次真实测量开始计时。
+constexpr qint64 gazePredictionTimeoutMs = 1000;
+constexpr qint64 pinchMeasurementTimeoutMs = 500;
+
+QPointF pinchScreenPoint(const QPointF& position, const QScreen* screen)
+{
+    const QRect area = screen->availableGeometry();
+    return QPointF(area.left() + std::clamp(position.x(), 0.0, 1.0) * std::max(0, area.width() - 1),
+                   area.top() + std::clamp(position.y(), 0.0, 1.0) * std::max(0, area.height() - 1));
+}
+
+// 独立透明光标只负责指示位置；不抢焦点，也不截获底下窗口的鼠标。
+class PinchPointerWindow final : public QWidget {
+public:
+    explicit PinchPointerWindow(QWidget* owner) : QWidget(owner,
+        Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+        Qt::WindowTransparentForInput | Qt::WindowDoesNotAcceptFocus)
+    {
+        setObjectName("pinchPointerWindow");
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_TransparentForMouseEvents);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setAttribute(Qt::WA_QuitOnClose, false);
+        setFixedSize(42, 42);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QColor color = property("grabbed").toBool() ? QColor("#a75bdb")
+            : property("headReady").toBool() ? QColor("#31c6ad") : QColor("#bc8adf");
+        painter.setPen(QPen(color, 2.5));
+        painter.setBrush(QColor(color.red(), color.green(), color.blue(), 35));
+        painter.drawEllipse(QPointF(21, 21), 13, 13);
+        painter.drawLine(QPointF(21, 3), QPointF(21, 10));
+        painter.drawLine(QPointF(21, 32), QPointF(21, 39));
+        painter.drawLine(QPointF(3, 21), QPointF(10, 21));
+        painter.drawLine(QPointF(32, 21), QPointF(39, 21));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(color);
+        painter.drawEllipse(QPointF(21, 21), 3, 3);
+    }
+};
+}
+
 PetWindow::PetWindow(QWidget* parent) : QWidget(parent)
 {
     setObjectName("nekoPetWindow");
@@ -43,6 +91,17 @@ PetWindow::PetWindow(QWidget* parent) : QWidget(parent)
         "QLabel { color: #255778; background: #e6f6ff; border: 1px solid #7bcdf3;"
         "border-radius: 11px; font-size: 13px; font-weight: 600; }"));
     gazeStatusLabel_->hide();
+
+    pinchStatusLabel_ = new QLabel(QStringLiteral("捏合拖动中"), this);
+    pinchStatusLabel_->setObjectName("pinchStatusLabel");
+    pinchStatusLabel_->setGeometry(18, 0, 224, 24);
+    pinchStatusLabel_->setAlignment(Qt::AlignCenter);
+    pinchStatusLabel_->setAttribute(Qt::WA_TransparentForMouseEvents);
+    pinchStatusLabel_->setStyleSheet(QStringLiteral(
+        "QLabel { color: #62338a; background: #f6eaff; border: 1px solid #c08ce5;"
+        "border-radius: 11px; font-size: 13px; font-weight: 600; }"));
+    pinchStatusLabel_->hide();
+    pinchPointerWindow_ = new PinchPointerWindow(this);
 
     clock_.start();
     timer_ = new QTimer(this);
@@ -136,6 +195,8 @@ void PetWindow::setCameraControls(bool checked, bool enabled)
     cameraSessionActive_ = checked;
     if (!checked) {
         handLostPending_ = false;
+        setPinchTarget(false, QPointF(), false);
+        setPinchPointer(false, QPointF());
         setGazeTarget(false, QPointF(0.5, 0.5));
     }
     const QSignalBlocker blocker(cameraAction_);
@@ -153,12 +214,24 @@ void PetWindow::setPreviewChecked(bool checked)
 void PetWindow::tick()
 {
     const qint64 now = clock_.elapsed();
+    if (pinchPointerVisible_ && now - pinchPointerUpdated_ > 250) {
+        setPinchPointer(false, QPointF());
+    }
+    // 后台停止送帧时也释放；无位置的保持信号不能延长此期限。
+    if (pinchActive_ && now - pinchMeasured_ >= pinchMeasurementTimeoutMs) {
+        endPinch(true);
+    }
     // 推理或设备暂时卡住时，也不能让目光一直停在旧位置。
-    if (gazeActive_ && now - gazeMeasured_ >= 500) {
+    if (gazeActive_ && now - gazeMeasured_ >= gazePredictionTimeoutMs) {
         setGazeTarget(false, QPointF(0.5, 0.5));
     }
     const double deltaSeconds = std::clamp((now - lastTick_) / 1000.0, 0.0, 0.1);
     lastTick_ = now;
+    carryLift_ += ((pinchActive_ ? 1.0 : 0.0) - carryLift_) *
+        (1.0 - std::exp(-deltaSeconds / 0.09));
+    if (std::abs(carryLift_ - (pinchActive_ ? 1.0 : 0.0)) < 0.002)
+        carryLift_ = pinchActive_ ? 1.0 : 0.0;
+    carrySway_ *= std::exp(-deltaSeconds / 0.20);
     const double blend = 1.0 - std::exp(-deltaSeconds / 0.10);
     gazePosition_ += (gazeTarget_ - gazePosition_) * blend;
     if (std::hypot(gazeTarget_.x() - gazePosition_.x(),
@@ -166,12 +239,13 @@ void PetWindow::tick()
         gazePosition_ = gazeTarget_;
     }
     const bool playingWave = pose_ == PetPose::Wave && now < poseDeadline_;
-    if (handLostPending_ && !gazeActive_ && !playingWave) {
+    if (handLostPending_ && !pinchActive_ && !gazeActive_ && !playingWave) {
         handLostPending_ = false;
         playPose(PetPose::Surprise, 2200);
     } else if (poseDeadline_ > 0 && now >= poseDeadline_) {
         playPose(PetPose::Idle, 0);
     }
+    updatePinchMotion(deltaSeconds);
     updateFollowMotion(deltaSeconds, now);
     update();
 }
@@ -179,7 +253,7 @@ void PetWindow::tick()
 void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
 {
     followMotion_.running = false;
-    if (!gazeActive_ || !isVisible()) {
+    if (pinchActive_ || !gazeActive_ || !isVisible()) {
         followPosition_ = QPointF(pos());
         return;
     }
@@ -190,7 +264,7 @@ void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
             ? QStringLiteral("挥完就来！") : QStringLiteral("等你继续指路"));
         return;
     }
-    // 最新跟踪目标过旧时先停步；真实测量的500ms期限负责退出跟随。
+    // 最新跟踪目标过旧时先停步；真实测量的1秒期限负责退出跟随。
     if (now - gazeTargetUpdated_ > 180) {
         followPosition_ = QPointF(pos());
         gazeStatusLabel_->setText(QStringLiteral("等你继续指路"));
@@ -234,10 +308,13 @@ void PetWindow::updateFollowMotion(double deltaSeconds, qint64 now)
 void PetWindow::setGazeTarget(bool active, const QPointF& position, bool predicted)
 {
     Q_ASSERT(QThread::currentThread() == thread());
+    // 捏合期间不接收食指追逐目标，避免两种移动方式争夺窗口。
+    if ((pinchActive_ || headHover_) && active) return;
     const qint64 now = clock_.elapsed();
     active = active && std::isfinite(position.x()) && std::isfinite(position.y());
     // 在入口也检查真实测量期限，防止动画计时器暂停时预测重新激活跟随。
-    if (active && predicted) active = gazeActive_ && now - gazeMeasured_ < 500;
+    if (active && predicted)
+        active = gazeActive_ && now - gazeMeasured_ < gazePredictionTimeoutMs;
     const bool changed = gazeActive_ != active;
     gazeActive_ = active;
     gazeStatusLabel_->setVisible(active);
@@ -268,6 +345,158 @@ void PetWindow::setGazeTarget(bool active, const QPointF& position, bool predict
     if (changed) emit gazeModeChanged(active);
 }
 
+void PetWindow::endPinch(bool blockUntilRelease)
+{
+    if (blockUntilRelease) pinchBlocked_ = true;
+    const bool wasActive = pinchActive_;
+    pinchActive_ = false;
+    pinchScreen_.clear();
+    headHover_ = false;
+    pinchTarget_ = QPointF(pos());
+    pinchStatusLabel_->hide();
+    pinchPointerWindow_->setProperty("grabbed", false);
+    pinchPointerWindow_->update();
+    followPosition_ = QPointF(pos());
+    followMotion_ = FollowMotion{};
+    if (wasActive) emit pinchModeChanged(false);
+    update();
+}
+
+void PetWindow::setPinchTarget(bool active, const QPointF& position, bool measured)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!active) {
+        pinchBlocked_ = false;
+        endPinch();
+        return;
+    }
+    if (pinchBlocked_) return;
+    if (!isVisible() || pressed_ || menu_->isVisible()) {
+        endPinch(true);
+        return;
+    }
+    const qint64 now = clock_.elapsed();
+    // 即使动画计时器暂停，过期输入也不能直接恢复之前的抓取。
+    if (pinchActive_ && now - pinchMeasured_ >= pinchMeasurementTimeoutMs) {
+        endPinch(true);
+        return;
+    }
+    measured = measured && std::isfinite(position.x()) && std::isfinite(position.y());
+    if (!measured) {
+        if (pinchActive_) {
+            pinchTarget_ = QPointF(pos()); // 短暂丢失时冻结，不拿旧坐标继续移动
+            pinchStatusLabel_->setText(QStringLiteral("捏合保持 · 等待位置"));
+        } else {
+            // 首次捏合缺少真实位置也算抓取失败，必须松开后重新尝试。
+            pinchBlocked_ = true;
+        }
+        return;
+    }
+    const QPointF target(std::clamp(position.x(), 0.0, 1.0),
+                         std::clamp(position.y(), 0.0, 1.0));
+    if (!pinchActive_) {
+        pinchScreen_ = QGuiApplication::screenAt(frameGeometry().center());
+        if (!pinchScreen_) pinchScreen_ = QGuiApplication::primaryScreen();
+        if (!pinchScreen_) return;
+        const QPointF pointer = pinchScreenPoint(target, pinchScreen_);
+        const QRectF head = robotHeadGrabArea(QRectF(10, 24, 240, 256)).translated(QPointF(pos()));
+        if (!head.contains(pointer)) {
+            pinchScreen_.clear();
+            pinchBlocked_ = true;
+            pinchStatusLabel_->setText(QStringLiteral("先松开，再捏合头顶"));
+            pinchStatusLabel_->show();
+            return;
+        }
+        // 抓取首帧只建立参考点，不把机器人瞬移到手的位置。
+        pinchAnchor_ = target;
+        pinchWindowAnchor_ = QPointF(pos());
+        pinchTarget_ = QPointF(pos());
+        setGazeTarget(false, QPointF(0.5, 0.5));
+        pinchActive_ = true;
+        headHover_ = false;
+        playPose(PetPose::Idle, 0);
+        emit pinchModeChanged(true);
+    }
+    if (!pinchScreen_) {
+        endPinch(true);
+        return;
+    }
+    pinchMeasured_ = now;
+    handLostPending_ = false;
+    const QRect area = pinchScreen_->availableGeometry();
+    const int rangeX = std::max(0, area.width() - width());
+    const int rangeY = std::max(0, area.height() - height());
+    const QPointF delta = target - pinchAnchor_;
+    pinchTarget_ = QPointF(
+        std::clamp(pinchWindowAnchor_.x() + delta.x() * std::max(0, area.width() - 1),
+                   double(area.left()), double(area.left() + rangeX)),
+        std::clamp(pinchWindowAnchor_.y() + delta.y() * std::max(0, area.height() - 1),
+                   double(area.top()), double(area.top() + rangeY)));
+    pinchStatusLabel_->setText(QStringLiteral("提起来啦 · 松开放下"));
+    pinchStatusLabel_->show();
+    pinchPointerWindow_->setProperty("grabbed", true);
+    pinchPointerWindow_->update();
+    update();
+}
+
+void PetWindow::setPinchPointer(bool visible, const QPointF& position)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    auto* screen = pinchScreen_ ? pinchScreen_.data()
+        : QGuiApplication::screenAt(frameGeometry().center());
+    if (!screen) screen = QGuiApplication::primaryScreen();
+    visible = visible && isVisible() && screen &&
+        std::isfinite(position.x()) && std::isfinite(position.y());
+    pinchPointerVisible_ = visible;
+    if (!visible) {
+        headHover_ = false;
+        pinchPointerWindow_->hide();
+        if (!pinchActive_) pinchStatusLabel_->hide();
+        update();
+        return;
+    }
+    pinchPointerUpdated_ = clock_.elapsed();
+    pinchPointerGlobal_ = pinchScreenPoint(position, screen);
+    const QRectF head = robotHeadGrabArea(QRectF(10, 24, 240, 256)).translated(QPointF(pos()));
+    headHover_ = !pinchActive_ && head.contains(pinchPointerGlobal_);
+    if (headHover_) {
+        // 对准头顶时停住食指追逐，方便完成抓取。
+        setGazeTarget(false, QPointF(0.5, 0.5));
+        pinchStatusLabel_->setText(pinchBlocked_ ? QStringLiteral("先松开，再捏合头顶")
+                                               : QStringLiteral("捏住头顶，提起我"));
+        pinchStatusLabel_->show();
+    } else if (!pinchActive_) {
+        pinchStatusLabel_->hide();
+    }
+    pinchPointerWindow_->setProperty("headReady", headHover_);
+    pinchPointerWindow_->setProperty("grabbed", pinchActive_);
+    pinchPointerWindow_->move(qRound(pinchPointerGlobal_.x()) - 21,
+                              qRound(pinchPointerGlobal_.y()) - 21);
+    pinchPointerWindow_->show();
+    pinchPointerWindow_->update();
+    update();
+}
+
+void PetWindow::updatePinchMotion(double deltaSeconds)
+{
+    if (!pinchActive_) return;
+    if (!pinchScreen_ || !isVisible() || pressed_ || menu_->isVisible()) {
+        endPinch(true);
+        return;
+    }
+    const QRect area = pinchScreen_->availableGeometry();
+    const QPointF current(pos());
+    const QPointF difference = pinchTarget_ - current;
+    const double distance = std::hypot(difference.x(), difference.y());
+    carrySway_ = std::clamp(-difference.x() * 0.06, -10.0, 10.0);
+    const double blend = distance < 1.5 ? 1.0 : 1.0 - std::exp(-deltaSeconds / 0.06);
+    const QPointF next = current + difference * blend;
+    move(qRound(std::clamp(next.x(), double(area.left()),
+                          double(area.left() + std::max(0, area.width() - width())))),
+         qRound(std::clamp(next.y(), double(area.top()),
+                          double(area.top() + std::max(0, area.height() - height())))));
+}
+
 void PetWindow::playPose(PetPose pose, int durationMs)
 {
     Q_ASSERT(QThread::currentThread() == thread());
@@ -280,6 +509,7 @@ void PetWindow::playPose(PetPose pose, int durationMs)
 
 void PetWindow::showPose(PetPose pose)
 {
+    if (pinchActive_) endPinch(true);
     handLostPending_ = false;
     playPose(pose, pose == PetPose::Idle || pose == PetPose::Sleep ? 0 : 2200);
 }
@@ -288,6 +518,15 @@ void PetWindow::reactTo(VisualEvent event)
 {
     // Do not connect a camera worker by calling QWidget functions directly.
     Q_ASSERT(QThread::currentThread() == thread());
+    if (pinchActive_) {
+        if (event == VisualEvent::HandDetected) {
+            handLostPending_ = false;
+            if (cameraSessionActive_) greetedThisSession_ = true;
+        } else if (event == VisualEvent::HandLost) {
+            handLostPending_ = true;
+        }
+        return;
+    }
     switch (event) {
     case VisualEvent::HandDetected:
         handLostPending_ = false;
@@ -329,6 +568,7 @@ void PetWindow::restore()
 
 void PetWindow::constrainToScreen()
 {
+    if (pinchActive_) endPinch(true);
     auto* screen = QGuiApplication::screenAt(frameGeometry().center());
     if (!screen) screen = QGuiApplication::primaryScreen();
     if (!screen) return;
@@ -346,9 +586,14 @@ void PetWindow::paintEvent(QPaintEvent*)
     painter.setRenderHint(QPainter::Antialiasing);
     const double elapsed = (clock_.elapsed() - poseStarted_) / 1000.0;
     paintRobot(painter, QRectF(10, 24, 240, 256), pose_, elapsed,
-               gazePosition_, gazeActive_, followMotion_);
+               gazePosition_, gazeActive_, followMotion_, CarryMotion{carryLift_, carrySway_});
+    if (headHover_) {
+        painter.setPen(QPen(QColor("#31c6ad"), 2.5, Qt::DashLine));
+        painter.setBrush(QColor(49, 198, 173, 30));
+        painter.drawRoundedRect(robotHeadGrabArea(QRectF(10, 24, 240, 256)), 18, 18);
+    }
 
-    if (!gazeActive_ &&
+    if (!pinchActive_ && !gazeActive_ &&
         (pose_ == PetPose::Happy || pose_ == PetPose::Wave || pose_ == PetPose::Surprise)) {
         QString text = pose_ == PetPose::Wave ? QStringLiteral("你好呀！")
                      : pose_ == PetPose::Happy ? QStringLiteral("今天也一起加油")
@@ -364,6 +609,7 @@ void PetWindow::paintEvent(QPaintEvent*)
 void PetWindow::mousePressEvent(QMouseEvent* event)
 {
     if (event->button() != Qt::LeftButton) return;
+    if (pinchActive_) endPinch(true);
     pressed_ = true;
     dragged_ = false;
     pressPosition_ = event->globalPosition().toPoint();
@@ -393,6 +639,7 @@ void PetWindow::mouseReleaseEvent(QMouseEvent* event)
 
 void PetWindow::contextMenuEvent(QContextMenuEvent* event)
 {
+    if (pinchActive_) endPinch(true);
     menu_->exec(event->globalPos());
 }
 
@@ -405,6 +652,8 @@ void PetWindow::showEvent(QShowEvent* event)
 
 void PetWindow::hideEvent(QHideEvent* event)
 {
+    if (pinchActive_) endPinch(true);
+    setPinchPointer(false, QPointF());
     followMotion_.running = false;
     timer_->stop();
     QWidget::hideEvent(event);

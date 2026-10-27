@@ -26,6 +26,7 @@ add_library(neko_vision_pipeline STATIC
     src/vision/hand_wave.cpp
     src/vision/hand_position.cpp
     src/vision/hand_position_tracker.cpp
+    src/vision/hand_pinch.cpp
     src/vision/hand.cpp
     src/vision/hand_interaction.cpp
 )
