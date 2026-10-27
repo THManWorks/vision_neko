@@ -4,6 +4,7 @@
 #include "hand_interaction.hpp"
 #include "hand_preview.hpp"
 #include "pointer_smoother.hpp"
+#include "onnx_loader.hpp"
 
 #include <QAction>
 #include <QCoreApplication>
@@ -1737,6 +1738,31 @@ private slots:
         QTRY_VERIFY(!controller.busy());
         QVERIFY(!controller.active());
         QVERIFY(status.last().at(0).toString().contains(QStringLiteral("手部姿态模型文件不存在")));
+    }
+
+    void desktopModelsAcceptUnicodeFilenamesWithoutCamera()
+    {
+        const QString palmPath = QFINDTESTDATA("../models/palm_detection_mediapipe_2023feb.onnx");
+        const QString handPath = QFINDTESTDATA("../models/handpose_estimation_mediapipe_2023feb.onnx");
+        if (palmPath.isEmpty() || handPath.isEmpty()) QSKIP("Local ONNX models not installed");
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString palmCopy = directory.filePath(QString::fromUtf8("手掌 model.onnx"));
+        const QString handCopy = directory.filePath(QString::fromUtf8("手部 pose.onnx"));
+        QVERIFY(QFile::copy(palmPath, palmCopy));
+        QVERIFY(QFile::copy(handPath, handCopy));
+        auto palmModel = loadDesktopOnnx(palmCopy);
+        const cv::Mat frame(480, 640, CV_8UC3, cv::Scalar(0));
+        const auto input = neko::vision::preprocessPalmFrame(frame);
+        const auto palmRaw = neko::vision::runPalmInference(palmModel, input.inputBlob);
+        QCOMPARE(palmRaw.rawScores.total(), std::size_t(2016));
+        QCOMPARE(palmRaw.rawBoxes.total(), std::size_t(2016 * 18));
+        auto handModel = loadDesktopOnnx(handCopy);
+        const int shape[] = {1, 224, 224, 3};
+        const cv::Mat blob(4, shape, CV_32F, cv::Scalar(0));
+        const auto handRaw = neko::vision::runHandPoseInference(handModel, blob);
+        QCOMPARE(handRaw.rawLandmarks.total(), std::size_t(63));
+        QCOMPARE(handRaw.rawWorldLandmarks.total(), std::size_t(63));
     }
 
     void localModelsAcceptInputsWithoutCamera()

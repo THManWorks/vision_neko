@@ -4,6 +4,7 @@
 #include "hand_preview.hpp"
 #include "pointer_smoother.hpp"
 #include "pinch_debug_overlay.hpp"
+#include "onnx_loader.hpp"
 
 #include <QDebug>
 #include <QElapsedTimer>
@@ -57,9 +58,9 @@ public:
         if (!QFileInfo(options_.handPoseModelPath).isFile()) {
             throw CameraFailure(QStringLiteral("手部姿态模型文件不存在，请检查 models 文件夹"));
         }
-        model_ = vision::loadPalmModel(options_.modelPath.toStdString());
+        model_ = loadDesktopOnnx(options_.modelPath);
         if (QThread::currentThread()->isInterruptionRequested()) return;
-        handPoseModel_ = vision::loadHandPoseModel(options_.handPoseModelPath.toStdString());
+        handPoseModel_ = loadDesktopOnnx(options_.handPoseModelPath);
         anchors_ = vision::createPalmAnchors();
         if (QThread::currentThread()->isInterruptionRequested()) return;
         if (!camera_.open(options_.cameraIndex, cv::CAP_DSHOW)) {

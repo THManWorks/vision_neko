@@ -12,6 +12,8 @@
 
 ## 编译与运行
 
+免安装运行包的使用方法见[运行包说明](portable.md)。开发机可用 `python tools/package-windows.py` 收集已构建程序、Qt插件、递归DLL依赖、模型、许可证和当前应用源码；再用 `python tools/verify-portable-windows.py` 在独立目录与系统PATH下验证启动、两个网络的合成推理及中文路径，成功后生成ZIP和SHA-256校验文件。Python仅为开发机打包使用，运行包接收者不需要安装Python。第三方包版本及来源记录在包内组件清单中。
+
 在项目根目录的 CMD 中运行：
 
 ```bat
@@ -155,4 +157,4 @@ cmake --build build && ctest --test-dir build --output-on-failure
 - `--pose wave`：指定初始姿态。
 - `--snapshot 路径.png`：保存窗口绘图。
 
-例如 `run-desktop.cmd --camera-index 1` 可选择另一个设备，再从右键菜单开启。当前版本整体联调已通过；成功率、延迟和长时间运行仍需定量检查，多显示器及不同缩放比例也需结合真实桌面检查。目前依赖本机MSYS2，尚未制作可复制到其他电脑直接运行的安装包。已检查exe的导入依赖及windeployqt部署清单：运行包需包含Qt Core/Gui/Widgets及插件（至少platforms/qwindows.dll）、OpenCV运行库和递归依赖、GCC运行库、两个ONNX模型及相关许可证；单独复制exe不足以运行。依赖检查尚不等于完成可移植运行包验证。
+例如 `run-desktop.cmd --camera-index 1` 可选择另一个设备，再从右键菜单开启。当前版本整体联调已通过；成功率、延迟和长时间运行仍需定量检查，多显示器及不同缩放比例也需结合真实桌面检查。2026-10-27已生成免安装ZIP，包含程序、200个依赖DLL、Qt插件、模型及相关许可证，接收者不需要安装MSYS2。独立目录、系统PATH、原生Qt启动、两个模型的合成推理及中文模型目录检查通过；其他电脑和真实摄像头尚未在运行包上实测。打包时发现中文路径无法直接传给OpenCV的问题，桌面改为QFile读入字节后加载模型，视觉源码及参数不变。
