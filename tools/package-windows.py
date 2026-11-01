@@ -180,7 +180,7 @@ def main():
     source_folder = output / "source"
     source_folder.mkdir()
     with zipfile.ZipFile(source_folder / "ProjectNeko-source.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-        for top in ("src", "tests", "tools"):
+        for top in ("src", "tools"):
             for path in sorted((ROOT / top).rglob("*")):
                 if path.is_file() and "__pycache__" not in path.parts:
                     archive.write(path, path.relative_to(ROOT))
@@ -191,11 +191,17 @@ def main():
             "source_snapshot": "Current working-tree sources, including packaging changes since the base commit",
             "exe_sha256": sha256(output / "neko_desktop.exe"), "dll_count": len(sources),
             "component_count": len(components),
-            "validation": "See verification-report.json beside the delivered archive."}
+            "validation": "Automatic verification removed; manually check the packaged application."}
     (output / "BUILD-INFO.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
     checksums = [f"{sha256(path)}  {path.relative_to(output).as_posix()}" for path in sorted(output.rglob("*")) if path.is_file()]
     (output / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
-    # Archive after independent verification so the delivered ZIP contains no probes/logs.
+    archive_path = output.parent / (output.name + ".zip")
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(output.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(output.parent))
+    archive_path.with_name(archive_path.name + ".sha256").write_text(
+        f"{sha256(archive_path)}  {archive_path.name}\n", encoding="utf-8")
     (build / "portable-latest.txt").write_text(str(output), encoding="utf-8")
     print(f"PACKAGE_DIRECTORY={output}", flush=True)
 

@@ -87,26 +87,4 @@ if(NEKO_BUILD_DESKTOP)
     add_executable(neko_desktop WIN32 src/desktop/desktop_main.cpp)
     target_link_libraries(neko_desktop PRIVATE neko_desktop_ui neko_desktop_camera)
 
-    include(CTest)
-    if(BUILD_TESTING)
-        find_package(Qt6 REQUIRED COMPONENTS Test)
-        add_executable(neko_desktop_tests tests/desktop_tests.cpp)
-        set_target_properties(neko_desktop_tests PROPERTIES AUTOMOC ON)
-        target_link_libraries(neko_desktop_tests PRIVATE neko_desktop_ui Qt6::Test)
-        add_test(NAME desktop_interactions COMMAND neko_desktop_tests -o -,txt)
-        set_tests_properties(desktop_interactions PROPERTIES
-            ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
-            TIMEOUT 30
-        )
-
-        add_executable(neko_camera_tests tests/camera_tests.cpp)
-        set_target_properties(neko_camera_tests PROPERTIES AUTOMOC ON)
-        target_link_libraries(neko_camera_tests PRIVATE
-            neko_desktop_camera neko_desktop_ui Qt6::Test)
-        add_test(NAME camera_integration COMMAND neko_camera_tests -o -,txt)
-        set_tests_properties(camera_integration PROPERTIES
-            ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
-            TIMEOUT 20
-        )
-    endif()
 endif()

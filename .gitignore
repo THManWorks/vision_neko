@@ -1,3 +1,5 @@
 /build/
 /models/*.onnx
 /docs/learning-notes.md
+__pycache__/
+*.py[cod]
