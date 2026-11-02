@@ -60,7 +60,7 @@ int main(int argc, char** argv)
 {
     QApplication app(argc, argv);
     app.setApplicationName("Project Neko Desktop");
-    app.setApplicationVersion("0.3.0");
+    app.setApplicationVersion(NEKO_VERSION);
     app.setQuitOnLastWindowClosed(false);
 
     QCommandLineParser parser;

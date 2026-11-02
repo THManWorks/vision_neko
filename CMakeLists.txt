@@ -2,7 +2,10 @@
 cmake_minimum_required(VERSION 3.22)
 
 # 项目名为 ProjectNeko，使用 C++ 语言
-project(ProjectNeko LANGUAGES CXX)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" NEKO_VERSION)
+string(STRIP "${NEKO_VERSION}" NEKO_VERSION)
+project(ProjectNeko VERSION ${NEKO_VERSION} LANGUAGES CXX)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 
 # 导出编译命令，供 VS Code 获取头文件路径等信息
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -85,6 +88,7 @@ if(NEKO_BUILD_DESKTOP)
 
     # WIN32 让桌面程序启动时不附带控制台窗口。
     add_executable(neko_desktop WIN32 src/desktop/desktop_main.cpp)
+    target_compile_definitions(neko_desktop PRIVATE NEKO_VERSION="${PROJECT_VERSION}")
     target_link_libraries(neko_desktop PRIVATE neko_desktop_ui neko_desktop_camera)
 
 endif()
