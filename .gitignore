@@ -1,5 +1,4 @@
 /build/
-/build-vision/
 /models/*.onnx
 /docs/learning-notes.md
 __pycache__/

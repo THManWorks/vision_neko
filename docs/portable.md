@@ -33,7 +33,6 @@ StartNeko.cmd --camera-index 1
 - `neko_desktop.exe`、同目录DLL、`platforms`、`styles`、`qt.conf`：程序和运行依赖，请完整保留。
 - `models`：两个ONNX模型及其许可证；移动整个文件夹时一并保留。
 - `licenses`、`THIRD-PARTY-NOTICES.md`：第三方组件的版本、来源与随附许可证。
-- `LICENSE-CODE.txt`：本项目原创代码的MIT许可证，第三方模型和库保留各自许可。
 - `BUILD-INFO.json`、`SHA256SUMS.txt`：打包来源及文件校验信息。
 - `source/ProjectNeko-source.zip`：本次应用源码和构建说明，不包含模型或第三方库源码。
 

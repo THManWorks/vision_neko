@@ -2,7 +2,7 @@
 
 基于 **C++17、OpenCV 和 Qt 6** 的 Windows 桌面互动角色。通过摄像头识别手势，让桌面角色回应挥手、追随食指，并支持捏住头顶提起和拖动。
 
-**项目状态：一期功能完成，暂时停止新增功能。** 当前源码版本为 **0.3.1**，使用程序绘制的猫耳机器人，无需下载角色图片。已发布的v0.3.0保留在Releases，0.3.1主要完善说明、代码许可和打包版本管理，核心互动功能保持原样。
+**项目状态：一期功能完成，暂时停止新增功能。** 当前版本为 **v0.3.0**，使用程序绘制的猫耳机器人，无需下载角色图片。本次仅完善项目说明，程序与已发布的运行包保持原样。
 
 [下载已发布版本](https://github.com/THManWorks/vision_neko/releases) · [详细操作说明](docs/desktop.md) · [运行包说明](docs/portable.md) · [开发记录](docs/development-log.md)
 
@@ -58,8 +58,8 @@ run-desktop.cmd
 `run-desktop.cmd`中的MSYS2和Qt插件路径同样需要与本机一致。只构建视觉预览：
 
 ```bat
-cmake -S . -B build-vision -DNEKO_BUILD_DESKTOP=OFF
-cmake --build build-vision --target neko
+cmake -S . -B build/vision -DNEKO_BUILD_DESKTOP=OFF
+cmake --build build/vision --target neko
 ```
 
 预览程序需要使用摄像头；请由操作者自行启动，并避免与桌面程序同时占用摄像头。
@@ -73,8 +73,7 @@ cmake --build build-vision --target neko
 
 摄像头默认关闭，推理在本机进行，不保存或上传图像；可选诊断日志只记录数值与事件。
 
-## 文档与许可
+## 文档与模型来源
 
-- [桌面操作与调试](docs/desktop.md)、[便携包说明](docs/portable.md)、[0.3.1版本说明](docs/release-notes.md)。
-- 本项目原创代码和文档采用[MIT许可证](LICENSE)。第三方库和模型不随本项目改授MIT。
+- [桌面操作与调试](docs/desktop.md)、[便携包说明](docs/portable.md)、[开发记录](docs/development-log.md)。
 - 模型许可证保留在`models/LICENSE.txt`；打包时收集第三方库版本、来源及许可证。

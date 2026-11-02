@@ -20,9 +20,6 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
-if not re.fullmatch(r"\d+\.\d+\.\d+", VERSION):
-    raise ValueError("VERSION must contain a major.minor.patch version")
 
 
 def run(command, **kwargs):
@@ -153,7 +150,7 @@ def main():
     env["PATH"] = str(prefix / "bin") + os.pathsep + env.get("PATH", "")
     run([prefix / "bin/cmake.exe", "--build", build, "--target", "neko_desktop"], cwd=ROOT, env=env)
     stamp = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d-%H%M%S")
-    output = ROOT / "build/portable" / f"Neko-{VERSION}-win64-{stamp}"
+    output = ROOT / "build/portable" / f"Neko-0.3.0-win64-{stamp}"
     output.mkdir(parents=True, exist_ok=False)
     shutil.copy2(build / "neko_desktop.exe", output)
     qt_command = [prefix / "bin/windeployqt.exe", "--release", "--no-translations",
@@ -177,7 +174,6 @@ def main():
     (output / "StartWithPreview.cmd").write_bytes(
         b'@echo off\r\ncall "%~dp0StartNeko.cmd" --camera --preview %*\r\n')
     (output / "README.txt").write_text((ROOT / "docs/portable.md").read_text(encoding="utf-8"), encoding="utf-8-sig")
-    shutil.copy2(ROOT / "LICENSE", output / "LICENSE-CODE.txt")
     components = package_metadata(output, prefix, sources)
     revision = run(["git", "-c", f"safe.directory={ROOT.as_posix()}", "rev-parse", "HEAD"],
                    cwd=ROOT, capture_output=True, text=True).stdout.strip()
@@ -188,15 +184,9 @@ def main():
             for path in sorted((ROOT / top).rglob("*")):
                 if path.is_file() and "__pycache__" not in path.parts:
                     archive.write(path, path.relative_to(ROOT))
-        for path in (ROOT / "CMakeLists.txt", ROOT / "VERSION", ROOT / "LICENSE", ROOT / "README.md",
-                     ROOT / "run-desktop.cmd", ROOT / ".gitignore", ROOT / "docs/desktop.md",
-                     ROOT / "docs/portable.md", ROOT / "docs/development-log.md", ROOT / "docs/release-notes.md",
-                     ROOT / "docs/images/desktop.png"):
+        for path in (ROOT / "CMakeLists.txt", ROOT / "docs/desktop.md", ROOT / "docs/portable.md"):
             archive.write(path, path.relative_to(ROOT))
-    dirty = bool(run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT,
-                     capture_output=True, text=True).stdout.strip())
-    info = {"application_version": VERSION, "stage": "phase-1-complete", "created_asia_shanghai": stamp,
-            "source_worktree_dirty": dirty,
+    info = {"application_version": "0.3.0", "stage": "phase-1", "created_asia_shanghai": stamp,
             "source_base_commit": revision, "platform": "Windows x64 UCRT64",
             "source_snapshot": "Current working-tree sources, including packaging changes since the base commit",
             "exe_sha256": sha256(output / "neko_desktop.exe"), "dll_count": len(sources),
